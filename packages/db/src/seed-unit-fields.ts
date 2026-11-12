@@ -1,9 +1,6 @@
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { Prisma, PrismaClient } from '@prisma/client';
-import { unitFieldTags } from './unit-field-tags';
-
-const prisma = new PrismaClient();
 
 type UnitFieldRow = [string, string, string, boolean, string];
 
@@ -39,158 +36,159 @@ function describe(sourceType: string) {
   return { fieldType: 'text', maxLength: undefined as number | undefined, editable: true, readOnly: false };
 }
 
-async function main() {
+export async function seedUnitFieldsForTenant(
+  tx: Prisma.TransactionClient,
+  tenantId: string,
+  createdBy: string,
+) {
   const names = rows.map((row) => row[1]);
   const duplicates = names.filter((name, index) => names.indexOf(name) !== index);
   if (duplicates.length) throw new Error(`Duplicate Unit field names: ${duplicates.join(', ')}`);
 
-  const tenants = await prisma.tenant.findMany({ select: { id: true, name: true } });
-  for (const tenant of tenants) {
-    const admin = await prisma.user.findFirst({
-      where: { tenantId: tenant.id, isActive: true },
-      orderBy: { createdAt: 'asc' },
-      select: { id: true },
-    });
-    if (!admin) {
-      console.warn(`Skipping ${tenant.name}: no active user`);
-      continue;
-    }
+  const existingObject = await tx.objectDefinition.findFirst({
+    where: { tenantId, name: 'Unit' },
+    select: { id: true, isActive: true },
+  });
+  if (existingObject && !existingObject.isActive) return 0;
+  const object = existingObject ?? await tx.objectDefinition.create({
+    data: {
+      tenantId,
+      name: 'Unit',
+      label: 'Unit',
+      pluralLabel: 'Units',
+      icon: 'building',
+      description: 'Manage project units',
+      objectType: 'standard',
+      createdBy,
+      updatedBy: createdBy,
+    },
+    select: { id: true },
+  });
 
-    const existing = await prisma.objectDefinition.findFirst({
-      where: { tenantId: tenant.id, name: 'Unit' },
-      select: { id: true },
-    });
-    const object = existing ?? await prisma.objectDefinition.create({
-      data: {
-        tenantId: tenant.id,
-        name: 'Unit',
-        label: 'Unit',
-        pluralLabel: 'Units',
-        icon: 'building',
-        description: 'Manage project units',
-        objectType: 'standard',
-        createdBy: admin.id,
-        updatedBy: admin.id,
-      },
-      select: { id: true },
-    });
+  const definitions = rows.map(([label, name, sourceType, required], index) => {
+    const described = describe(sourceType);
+    return {
+      tenantId,
+      objectId: object.id,
+      name,
+      label,
+      fieldType: described.fieldType,
+      description: sourceType,
+      helpText: described.readOnly
+        ? `Calculated from the unit record. Salesforce type: ${sourceType}.`
+        : `Salesforce type: ${sourceType}.`,
+      required,
+      maxLength: described.maxLength,
+      precision: 'precision' in described ? described.precision : undefined,
+      scale: 'scale' in described ? described.scale : undefined,
+      lookupObject: 'lookupObject' in described ? described.lookupObject : undefined,
+      visible: true,
+      editable: described.editable,
+      isActive: true,
+      isSystemField: name === 'Name' || name === 'CreatedById' || name === 'LastModifiedById',
+      isCustomField: name.endsWith('__c') || name === 'OwnerId',
+      isStandardField: !name.endsWith('__c') && name !== 'OwnerId',
+      searchable: true,
+      sortable: !described.readOnly,
+      filterable: described.fieldType === 'picklist' || described.fieldType === 'dateTime',
+      displayOrder: index,
+      createdBy,
+      updatedBy: createdBy,
+    };
+  });
+  const created = await tx.fieldDefinition.createMany({ data: definitions, skipDuplicates: true });
 
-    const removed = await prisma.fieldDefinition.deleteMany({ where: { objectId: object.id } });
-
-    for (const [index, [label, name, sourceType, required]] of rows.entries()) {
-      const described = describe(sourceType);
-      await prisma.fieldDefinition.create({
-        data: {
-          tenantId: tenant.id,
-          objectId: object.id,
-          name,
-          label,
-          fieldType: described.fieldType,
-          description: sourceType,
-          helpText: described.readOnly
-            ? `Calculated from the unit record. Salesforce type: ${sourceType}.`
-            : `Salesforce type: ${sourceType}.`,
-          required,
-          maxLength: described.maxLength,
-          precision: 'precision' in described ? described.precision : undefined,
-          scale: 'scale' in described ? described.scale : undefined,
-          lookupObject: 'lookupObject' in described ? described.lookupObject : undefined,
-          visible: true,
-          editable: described.editable,
+  const fields = await tx.fieldDefinition.findMany({
+    where: { tenantId, objectId: object.id, name: { in: Object.keys(picklists) } },
+    select: { id: true, name: true },
+  });
+  for (const field of fields) {
+    for (const [displayOrder, value] of picklists[field.name].entries()) {
+      await tx.picklistValue.upsert({
+        where: { fieldId_value: { fieldId: field.id, value } },
+        create: {
+          tenantId,
+          fieldId: field.id,
+          label: value,
+          value,
           isActive: true,
-          isSystemField: name === 'Name' || name === 'CreatedById' || name === 'LastModifiedById',
-          isCustomField: name.endsWith('__c') || name === 'OwnerId',
-          isStandardField: !name.endsWith('__c') && name !== 'OwnerId',
-          searchable: true,
-          sortable: !described.readOnly,
-          filterable: described.fieldType === 'picklist' || described.fieldType === 'dateTime',
-          displayOrder: index,
-          createdBy: admin.id,
-          updatedBy: admin.id,
+          isDefault: displayOrder === 0 && field.name === 'Status__c',
+          displayOrder,
         },
+        update: {},
       });
     }
+  }
 
-    const createdFields = await prisma.fieldDefinition.findMany({
-      where: { objectId: object.id },
-      select: { id: true, name: true },
+  const standardSections = ['Unit Information', 'Area', 'Pricing', 'System']
+    .map((name) => ({
+      name,
+      fields: rows.filter((row) => row[4] === name).map((row) => row[1]),
+    }))
+    .filter((section) => section.fields.length > 0);
+  const layout = await tx.pageLayout.findUnique({
+    where: { objectId_name: { objectId: object.id, name: 'Default Layout' } },
+  });
+  if (!layout) {
+    await tx.pageLayout.create({
+      data: {
+        tenantId,
+        objectId: object.id,
+        name: 'Default Layout',
+        isDefault: true,
+        sections: standardSections,
+        createdBy,
+      },
     });
-    for (const field of createdFields) {
-      const values = picklists[field.name];
-      if (!values) continue;
-      for (const [optionIndex, value] of values.entries()) {
-        await prisma.picklistValue.create({
-          data: {
-            tenantId: tenant.id,
-            fieldId: field.id,
-            label: value,
-            value,
-            isActive: true,
-            isDefault: optionIndex === 0 && field.name === 'Status__c',
-            displayOrder: optionIndex,
-          },
-        });
+  } else {
+    const storedSections = (typeof layout.sections === 'string'
+      ? JSON.parse(layout.sections)
+      : layout.sections) as Array<{ name: string; fields?: string[] }>;
+    const sections = Array.isArray(storedSections) ? [...storedSections] : [];
+    for (const standardSection of standardSections) {
+      const existing = sections.find((section) => section.name === standardSection.name);
+      if (existing) {
+        existing.fields = [...new Set([...(existing.fields ?? []), ...standardSection.fields])];
+      } else {
+        sections.push(standardSection);
       }
     }
-
-    const sections = ['Unit Information', 'Area', 'Pricing', 'System'].map((section) => ({
-      name: section,
-      fields: rows.filter((row) => row[4] === section).map((row) => row[1]),
-    })).filter((section) => section.fields.length > 0);
-
-    const layouts = await prisma.pageLayout.findMany({ where: { objectId: object.id }, select: { id: true } });
-    if (layouts.length === 0) {
-      await prisma.pageLayout.create({
-        data: {
-          tenantId: tenant.id,
-          objectId: object.id,
-          name: 'Default Layout',
-          isDefault: true,
-          sections,
-          createdBy: admin.id,
-        },
-      });
-    } else {
-      await prisma.pageLayout.updateMany({
-        where: { objectId: object.id },
-        data: { sections: sections as Prisma.InputJsonValue, updatedBy: admin.id },
-      });
-    }
-
-    const units = await prisma.unit.findMany({
-      where: { tenantId: tenant.id },
-      include: {
-        project: { select: { name: true } },
-        bookings: { select: { status: true, lead: { select: { source: true } } } },
-      },
+    await tx.pageLayout.update({
+      where: { id: layout.id },
+      data: { sections, updatedBy: createdBy },
     });
-    for (const unit of units) {
-      const activeBooking = unit.bookings.find((booking) => booking.status !== 'CANCELLED');
-      const stored = unit.customFields && typeof unit.customFields === 'object' && !Array.isArray(unit.customFields)
-        ? unit.customFields as Record<string, unknown>
-        : {};
-      await prisma.unit.update({
-        where: { id: unit.id },
-        data: {
-          customFields: {
-            ...stored,
-            ...unitFieldTags({
-              ...unit,
-              projectName: unit.project?.name ?? null,
-              bookingSource: activeBooking?.lead?.source ?? null,
-            }),
-          } as Prisma.InputJsonValue,
-        },
-      });
-    }
+  }
+  return created.count;
+}
 
-    console.log(`${tenant.name}: removed ${removed.count} Unit fields, created ${rows.length}, tagged ${units.length} units`);
+async function main() {
+  const prisma = new PrismaClient();
+  try {
+    const tenants = await prisma.tenant.findMany({
+    where: { isActive: true },
+    select: { id: true, name: true },
+  });
+    for (const tenant of tenants) {
+      const user = await prisma.user.findFirst({
+        where: { tenantId: tenant.id, isActive: true },
+        orderBy: { createdAt: 'asc' },
+        select: { id: true },
+      });
+      if (!user) {
+        console.warn(`Skipping ${tenant.name}: no active user is available for metadata ownership.`);
+        continue;
+      }
+      const count = await prisma.$transaction((tx) => seedUnitFieldsForTenant(tx, tenant.id, user.id));
+      console.log(`${tenant.name}: created ${count} Unit fields.`);
+    }
+  } finally {
+    await prisma.$disconnect();
   }
 }
 
-main()
-  .catch((error) => {
+if ((process.argv[1] || '').includes('seed-unit-fields')) {
+  main().catch((error) => {
     console.error(error);
     process.exitCode = 1;
-  })
-  .finally(() => prisma.$disconnect());
+  });
+}

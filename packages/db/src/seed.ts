@@ -4,47 +4,12 @@ import * as bcrypt from 'bcrypt';
 
 const prisma = new PrismaClient();
 
-const removedCommercialObjects = [
-  'Approval',
-  'Opportunity',
-  'Payment',
-  'PaymentAllocation',
-  'Quotation',
-  'QuotationInstallment',
-  'QuotationItem',
-  'Receipt',
-];
-
-async function removeCommercialMetadata() {
-  await prisma.pageLayout.deleteMany({
-    where: { object: { is: { name: { in: removedCommercialObjects } } } },
-  });
-  await prisma.permissionSetRole.deleteMany({
-    where: { permissionSet: { is: { objectName: { in: removedCommercialObjects } } } },
-  });
-  await prisma.permissionSet.deleteMany({
-    where: { objectName: { in: removedCommercialObjects } },
-  });
-  await prisma.objectDefinition.deleteMany({
-    where: { name: { in: removedCommercialObjects } },
-  });
-  await prisma.permission.deleteMany({
-    where: {
-      module: {
-        in: ['APPROVAL', 'MIS_QUOTATION_REVIEW', 'OPPORTUNITY', 'PAYMENT', 'QUOTATION', 'RECEIPT'],
-      },
-    },
-  });
-}
-
 async function hashPassword(password: string): Promise<string> {
   return bcrypt.hash(password, 12);
 }
 
 async function main() {
   console.log('Seeding DCT CRM database...');
-
-  await removeCommercialMetadata();
 
   const existingTenant = await prisma.tenant.findUnique({
     where: { slug: 'dct-re' },

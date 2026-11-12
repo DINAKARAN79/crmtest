@@ -1,6 +1,4 @@
-import { PrismaClient } from '@prisma/client';
-
-const prisma = new PrismaClient();
+import { Prisma, PrismaClient } from '@prisma/client';
 
 interface FieldSeed {
   name: string;
@@ -259,18 +257,14 @@ const STANDARD_LEAD_FIELDS: FieldSeed[] = [
   },
 ];
 
-async function seedLeadFieldsForTenant(tenantId: string, createdBy: string) {
-  const operationalCustomFieldNames = new Set([
-    'source', 'firstCampaign', 'lastCampaign', 'leadInterest', 'status', 'rating', 'description', 'score',
-  ]);
-  const configuredPicklistFieldNames = new Set(['source', 'firstCampaign', 'lastCampaign', 'leadInterest']);
+export async function seedLeadFieldsForTenant(tx: Prisma.TransactionClient, tenantId: string, createdBy: string) {
   // Find or create Lead ObjectDefinition
-  let leadObject = await prisma.objectDefinition.findFirst({
+  let leadObject = await tx.objectDefinition.findFirst({
     where: { tenantId, name: { equals: 'Lead', mode: 'insensitive' } },
   });
 
   if (!leadObject) {
-    leadObject = await prisma.objectDefinition.create({
+    leadObject = await tx.objectDefinition.create({
       data: {
         tenantId,
         name: 'Lead',
@@ -287,201 +281,163 @@ async function seedLeadFieldsForTenant(tenantId: string, createdBy: string) {
   } else {
     // Update objectType to standard if it was custom
     if (leadObject.objectType !== 'standard') {
-      await prisma.objectDefinition.update({
+      await tx.objectDefinition.update({
         where: { id: leadObject.id },
         data: { objectType: 'standard' },
       });
     }
   }
 
-  let createdCount = 0;
-  let skippedCount = 0;
-
-  for (const fieldSeed of STANDARD_LEAD_FIELDS) {
-    const existing = await prisma.fieldDefinition.findFirst({
-      where: { objectId: leadObject.id, name: fieldSeed.name },
+  const existingFields = await tx.fieldDefinition.findMany({
+    where: {
+      objectId: leadObject.id,
+      name: { in: STANDARD_LEAD_FIELDS.map(({ name }) => name) },
+    },
+    select: { id: true, name: true },
+  });
+  const existingNames = new Set(existingFields.map(({ name }) => name));
+  const fieldsToCreate = STANDARD_LEAD_FIELDS
+    .filter(({ name }) => !existingNames.has(name))
+    .map(({ picklistValues: _picklistValues, ...fieldData }) => ({
+      tenantId,
+      objectId: leadObject.id,
+      ...fieldData,
+      isCustomField: fieldData.isCustomField ?? false,
+      createdBy,
+      updatedBy: createdBy,
+    }));
+  const created = await tx.fieldDefinition.createMany({
+    data: fieldsToCreate,
+    skipDuplicates: true,
+  });
+  const allLeadFields = await tx.fieldDefinition.findMany({
+    where: {
+      objectId: leadObject.id,
+      name: { in: STANDARD_LEAD_FIELDS.map(({ name }) => name) },
+    },
+    select: { id: true, name: true },
+  });
+  const fieldIdsByName = new Map(allLeadFields.map(({ id, name }) => [name, id]));
+  const picklistValues = STANDARD_LEAD_FIELDS.flatMap((fieldSeed) => {
+    const fieldId = fieldIdsByName.get(fieldSeed.name);
+    if (!fieldId) return [];
+    return (fieldSeed.picklistValues ?? []).map((value) => ({
+      tenantId,
+      fieldId,
+      label: value.label,
+      value: value.value,
+      isDefault: value.isDefault ?? false,
+      displayOrder: value.displayOrder,
+    }));
+  });
+  if (picklistValues.length > 0) {
+    await tx.picklistValue.createMany({
+      data: picklistValues,
+      skipDuplicates: true,
     });
-
-    if (existing) {
-      if (
-        configuredPicklistFieldNames.has(fieldSeed.name) &&
-        existing.fieldType !== fieldSeed.fieldType
-      ) {
-        await prisma.fieldDefinition.update({
-          where: { id: existing.id },
-          data: { fieldType: fieldSeed.fieldType },
-        });
-      }
-      if (
-        operationalCustomFieldNames.has(fieldSeed.name) &&
-        (
-          existing.isSystemField !== (fieldSeed.isSystemField ?? false) ||
-          existing.isStandardField !== (fieldSeed.isStandardField ?? false) ||
-          existing.isCustomField !== (fieldSeed.isCustomField ?? false)
-        )
-      ) {
-        await prisma.fieldDefinition.update({
-          where: { id: existing.id },
-          data: {
-            isSystemField: fieldSeed.isSystemField ?? false,
-            isStandardField: fieldSeed.isStandardField ?? false,
-            isCustomField: fieldSeed.isCustomField ?? false,
-          },
-        });
-      }
-      if (fieldSeed.label && existing.label !== fieldSeed.label) {
-        await prisma.fieldDefinition.update({
-          where: { id: existing.id },
-          data: { label: fieldSeed.label },
-        });
-      }
-      if (fieldSeed.visible !== undefined && existing.visible !== fieldSeed.visible) {
-        await prisma.fieldDefinition.update({
-          where: { id: existing.id },
-          data: { visible: fieldSeed.visible },
-        });
-      }
-      if (configuredPicklistFieldNames.has(fieldSeed.name) && !existing.isActive) {
-        await prisma.fieldDefinition.update({
-          where: { id: existing.id },
-          data: { isActive: true },
-        });
-      }
-      if (fieldSeed.picklistValues?.length) {
-        for (const value of fieldSeed.picklistValues) {
-          await prisma.picklistValue.upsert({
-            where: { fieldId_value: { fieldId: existing.id, value: value.value } },
-            update: {
-              label: value.label,
-              isDefault: value.isDefault ?? false,
-              displayOrder: value.displayOrder,
-            },
-            create: {
-              tenantId,
-              fieldId: existing.id,
-              label: value.label,
-              value: value.value,
-              isDefault: value.isDefault ?? false,
-              displayOrder: value.displayOrder,
-            },
-          });
-        }
-      }
-      skippedCount++;
-      continue;
-    }
-
-    const { picklistValues, ...fieldData } = fieldSeed;
-
-    const field = await prisma.fieldDefinition.create({
-      data: {
-        tenantId,
-        objectId: leadObject.id,
-        ...fieldData,
-        isCustomField: fieldData.isCustomField ?? false,
-        createdBy,
-        updatedBy: createdBy,
-      },
-    });
-
-    // Create picklist values if they exist
-    if (picklistValues && picklistValues.length > 0) {
-      for (const pv of picklistValues) {
-        await prisma.picklistValue.create({
-          data: {
-            tenantId,
-            fieldId: field.id,
-            label: pv.label,
-            value: pv.value,
-            isDefault: pv.isDefault ?? false,
-            displayOrder: pv.displayOrder,
-          },
-        });
-      }
-    }
-
-    createdCount++;
   }
+  const createdCount = created.count;
+  const skippedCount = STANDARD_LEAD_FIELDS.length - createdCount;
 
   // Create default layout if it doesn't exist
-  const existingLayout = await prisma.pageLayout.findFirst({
+  const existingLayout = await tx.pageLayout.findFirst({
     where: { objectId: leadObject.id, name: 'Default Layout' },
   });
 
+  const standardLayoutSections = [
+    {
+      name: 'Contact Information',
+      fields: ['salutation', 'firstName', 'lastName', 'title', 'email', 'phone', 'mobile'],
+    },
+    {
+      name: 'Company Information',
+      fields: ['company', 'industry', 'annualRevenue', 'numberOfEmployees'],
+    },
+    {
+      name: 'Lead Details',
+      fields: ['source', 'firstCampaign', 'lastCampaign', 'leadInterest', 'status', 'rating', 'description'],
+    },
+    {
+      name: 'Address',
+      fields: ['street', 'city', 'stateProvince', 'country', 'postalCode'],
+    },
+    {
+      name: 'System Information',
+      fields: ['record_number', 'owner', 'created_by', 'created_at', 'updated_at'],
+    },
+  ];
+
   if (!existingLayout) {
-    await prisma.pageLayout.create({
+    await tx.pageLayout.create({
       data: {
         tenantId,
         objectId: leadObject.id,
         name: 'Default Layout',
         isDefault: true,
-        sections: JSON.stringify([
-          {
-            name: 'Contact Information',
-            fields: ['salutation', 'firstName', 'lastName', 'title', 'email', 'phone', 'mobile'],
-          },
-          {
-            name: 'Company Information',
-            fields: ['company', 'industry', 'annualRevenue', 'numberOfEmployees'],
-          },
-          {
-            name: 'Lead Details',
-            fields: ['source', 'firstCampaign', 'lastCampaign', 'leadInterest', 'status', 'rating', 'description'],
-          },
-          {
-            name: 'Address',
-            fields: ['street', 'city', 'stateProvince', 'country', 'postalCode'],
-          },
-          {
-            name: 'System Information',
-            fields: ['record_number', 'owner', 'created_by', 'created_at', 'updated_at'],
-          },
-        ]),
+        sections: standardLayoutSections,
         createdBy,
       },
     });
     console.log(`  Created Default Layout for Lead object`);
+  } else {
+    const storedSections = (typeof existingLayout.sections === 'string'
+      ? JSON.parse(existingLayout.sections)
+      : existingLayout.sections) as Array<{ name: string; fields?: string[] }>;
+    const sections = Array.isArray(storedSections) ? [...storedSections] : [];
+    for (const standardSection of standardLayoutSections) {
+      const existing = sections.find((section) => section.name === standardSection.name);
+      if (existing) {
+        existing.fields = [...new Set([...(existing.fields ?? []), ...standardSection.fields])];
+      } else {
+        sections.push(standardSection);
+      }
+    }
+    await tx.pageLayout.update({
+      where: { id: existingLayout.id },
+      data: { sections, updatedBy: createdBy },
+    });
   }
 
   return { createdCount, skippedCount };
 }
 
 async function main() {
+  const prisma = new PrismaClient();
   console.log('Seeding standard Lead fields...\n');
 
-  const tenants = await prisma.tenant.findMany({ where: { isActive: true } });
-
-  if (tenants.length === 0) {
-    console.log('No active tenants found. Skipping seed.');
-    return;
-  }
-
-  for (const tenant of tenants) {
-    console.log(`Processing tenant: ${tenant.name} (${tenant.id})`);
-
-    // Find first admin user in this tenant for createdBy
-    const adminUser = await prisma.user.findFirst({
-      where: { tenantId: tenant.id, isActive: true },
-      orderBy: { createdAt: 'asc' },
-    });
-
-    if (!adminUser) {
-      console.log(`  No users found for tenant ${tenant.id}. Skipping.`);
-      continue;
+  try {
+    const tenants = await prisma.tenant.findMany({ where: { isActive: true } });
+    if (tenants.length === 0) {
+      console.log('No active tenants found. Skipping seed.');
+      return;
     }
 
-    const result = await seedLeadFieldsForTenant(tenant.id, adminUser.id);
-    console.log(`  Created: ${result.createdCount} fields, Skipped: ${result.skippedCount} existing\n`);
+    for (const tenant of tenants) {
+      console.log(`Processing tenant: ${tenant.name} (${tenant.id})`);
+
+      const adminUser = await prisma.user.findFirst({
+        where: { tenantId: tenant.id, isActive: true },
+        orderBy: { createdAt: 'asc' },
+      });
+
+      if (!adminUser) {
+        console.log(`  No users found for tenant ${tenant.id}. Skipping.`);
+        continue;
+      }
+
+      const result = await prisma.$transaction((tx) => seedLeadFieldsForTenant(tx, tenant.id, adminUser.id));
+      console.log(`  Created: ${result.createdCount} fields, Skipped: ${result.skippedCount} existing\n`);
+    }
+  } finally {
+    await prisma.$disconnect();
   }
 
   console.log('Standard Lead fields seeded successfully!');
 }
 
-main()
-  .catch((e) => {
+if ((process.argv[1] || '').includes('seed-lead-fields')) {
+  main().catch((e) => {
     console.error('Seed failed:', e);
-    process.exit(1);
-  })
-  .finally(async () => {
-    await prisma.$disconnect();
+    process.exitCode = 1;
   });
+}

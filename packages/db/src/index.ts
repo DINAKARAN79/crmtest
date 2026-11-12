@@ -46,3 +46,6 @@ if (process.env.NODE_ENV !== 'production') globalForPrisma.prisma = prisma;
 
 export * from '@prisma/client';
 export * from './unit-field-tags';
+export { seedLeadFieldsForTenant } from './seed-lead-fields';
+export { seedSalesforceMetadataForTenant } from './seed-salesforce-fields';
+export { seedUnitFieldsForTenant } from './seed-unit-fields';

@@ -1,9 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { PrismaClient } from '@prisma/client';
+import { Prisma, PrismaClient } from '@prisma/client';
 import { ENQUIRY_SOURCE_API_NAMES } from './enquiry-source-fields';
-
-const prisma = new PrismaClient();
 
 interface ExportedField {
   label: string;
@@ -30,6 +28,7 @@ const standardObjects = [
   { name: 'Company', label: 'Company', pluralLabel: 'Companies', icon: 'building', description: 'Manage companies' },
   { name: 'Booking', label: 'Booking', pluralLabel: 'Bookings', icon: 'book-open-check', description: 'Plot bookings created from quotations' },
   { name: 'FollowUp', label: 'Follow-up', pluralLabel: 'Follow-ups', icon: 'phone', description: 'Manage lead follow-ups' },
+  { name: 'Task', label: 'Task', pluralLabel: 'Tasks', icon: 'check-square', description: 'Task management' },
   { name: 'Activity', label: 'Activity', pluralLabel: 'Activities', icon: 'activity', description: 'Track CRM activities' },
   { name: 'CallDetail', label: 'Call Detail', pluralLabel: 'Call Details', icon: 'phone', description: 'Track inbound and outbound calls', isAvailableInNavigation: false },
 ];
@@ -146,12 +145,13 @@ function toFieldDefinitions(
 }
 
 async function seedObjectFields(
+  tx: Prisma.TransactionClient,
   tenantId: string,
   createdBy: string,
   objectName: 'Lead' | 'SiteVisit',
   rows: ExportedField[],
 ) {
-  const existingObject = await prisma.objectDefinition.findFirst({
+  const existingObject = await tx.objectDefinition.findFirst({
     where: { tenantId, name: objectName },
     select: { id: true, isActive: true },
   });
@@ -159,7 +159,7 @@ async function seedObjectFields(
     console.warn(`  ${objectName} object metadata is inactive; skipping it.`);
     return 0;
   }
-  const object = existingObject ?? await prisma.objectDefinition.create({
+  const object = existingObject ?? await tx.objectDefinition.create({
     data: {
       tenantId,
       name: objectName,
@@ -179,41 +179,33 @@ async function seedObjectFields(
     .filter((field) => field.isCustomField)
     .map((field) => field.name);
 
-  const created = await prisma.fieldDefinition.createMany({
+  const created = await tx.fieldDefinition.createMany({
     data: definitions.map((field) => ({ ...field, tenantId, objectId: object.id })),
     skipDuplicates: true,
   });
 
   if (objectName === 'Lead') {
-    const leadTypeField = await prisma.fieldDefinition.findFirst({
+    const leadTypeField = await tx.fieldDefinition.findFirst({
       where: { tenantId, objectId: object.id, name: 'sf_Lead_Type__c' },
       select: { id: true },
     });
     if (leadTypeField) {
-      await prisma.fieldDefinition.update({
-        where: { id: leadTypeField.id },
-        data: { fieldType: 'picklist', helpText: null, visible: true, editable: true },
-      });
       const lifecycleTypes = [
         { label: 'Fresh', value: 'Fresh', displayOrder: 0, isDefault: true },
         { label: 'Re-Opened', value: 'Re-Opened', displayOrder: 1, isDefault: false },
         { label: 'Re-Engaged', value: 'Re-Engaged', displayOrder: 2, isDefault: false },
       ];
-      await prisma.picklistValue.updateMany({
-        where: { tenantId, fieldId: leadTypeField.id, value: { notIn: lifecycleTypes.map(({ value }) => value) } },
-        data: { isActive: false },
-      });
       for (const option of lifecycleTypes) {
-        await prisma.picklistValue.upsert({
+        await tx.picklistValue.upsert({
           where: { fieldId_value: { fieldId: leadTypeField.id, value: option.value } },
           create: { tenantId, fieldId: leadTypeField.id, ...option, isActive: true },
-          update: { ...option, isActive: true },
+          update: {},
         });
       }
     }
   }
 
-  const existingLayout = await prisma.pageLayout.findFirst({
+  const existingLayout = await tx.pageLayout.findFirst({
     where: { objectId: object.id, name: 'Default Layout' },
   });
   const rawSections = existingLayout
@@ -259,25 +251,27 @@ async function seedObjectFields(
     }
   } else {
     const sectionName = 'Imported Salesforce Site Visit Fields';
-    updatedSections = [
-      ...sections.filter((section) => section.name !== sectionName),
-      { name: sectionName, fields: importedNames },
-    ];
+    const existingSection = sections.find((section) => section.name === sectionName);
+    updatedSections = existingSection
+      ? sections.map((section) => section.name === sectionName
+        ? { ...section, fields: [...new Set([...section.fields, ...importedNames])] }
+        : section)
+      : [...sections, { name: sectionName, fields: importedNames }];
   }
 
   if (existingLayout) {
-    await prisma.pageLayout.update({
+    await tx.pageLayout.update({
       where: { id: existingLayout.id },
-      data: { sections: JSON.stringify(updatedSections), updatedBy: createdBy },
+      data: { sections: updatedSections, updatedBy: createdBy },
     });
   } else {
-    await prisma.pageLayout.create({
+    await tx.pageLayout.create({
       data: {
         tenantId,
         objectId: object.id,
         name: 'Default Layout',
         isDefault: true,
-        sections: JSON.stringify(updatedSections),
+        sections: updatedSections,
         createdBy,
       },
     });
@@ -286,8 +280,8 @@ async function seedObjectFields(
   return created.count;
 }
 
-export async function seedEnquiryFields(tenantId: string, createdBy: string) {
-  const object = await prisma.objectDefinition.findFirst({
+async function seedEnquiryFieldsInTransaction(tx: Prisma.TransactionClient, tenantId: string, createdBy: string) {
+  const object = await tx.objectDefinition.findFirst({
     where: { tenantId, name: 'Enquiry', isActive: true },
     select: { id: true },
   });
@@ -315,12 +309,53 @@ export async function seedEnquiryFields(tenantId: string, createdBy: string) {
       createdBy,
     };
   });
-  const created = await prisma.fieldDefinition.createMany({ data: definitions, skipDuplicates: true });
+  const created = await tx.fieldDefinition.createMany({ data: definitions, skipDuplicates: true });
+  const layout = await tx.pageLayout.findFirst({
+    where: { objectId: object.id, name: 'Default Layout' },
+  });
+  const sectionName = 'Imported Salesforce Enquiry Fields';
+  const fieldNames = definitions.map((field) => field.name);
+  if (!layout) {
+    await tx.pageLayout.create({
+      data: {
+        tenantId,
+        objectId: object.id,
+        name: 'Default Layout',
+        isDefault: true,
+        sections: [{ name: sectionName, fields: fieldNames }],
+        createdBy,
+      },
+    });
+  } else {
+    const storedSections = (typeof layout.sections === 'string'
+      ? JSON.parse(layout.sections)
+      : layout.sections) as Array<{ name: string; fields?: string[] }>;
+    const sections = Array.isArray(storedSections) ? [...storedSections] : [];
+    const existingSection = sections.find((section) => section.name === sectionName);
+    if (existingSection) {
+      existingSection.fields = [...new Set([...(existingSection.fields ?? []), ...fieldNames])];
+    } else {
+      sections.push({ name: sectionName, fields: fieldNames });
+    }
+    await tx.pageLayout.update({
+      where: { id: layout.id },
+      data: { sections, updatedBy: createdBy },
+    });
+  }
   return created.count;
 }
 
-async function seedTaskFields(tenantId: string, createdBy: string) {
-  const object = await prisma.objectDefinition.findFirst({
+export async function seedEnquiryFields(tenantId: string, createdBy: string) {
+  const prisma = new PrismaClient();
+  try {
+    return await prisma.$transaction((tx) => seedEnquiryFieldsInTransaction(tx, tenantId, createdBy));
+  } finally {
+    await prisma.$disconnect();
+  }
+}
+
+async function seedTaskFields(tx: Prisma.TransactionClient, tenantId: string, createdBy: string) {
+  const object = await tx.objectDefinition.findFirst({
     where: { tenantId, name: 'Task', isActive: true },
     select: { id: true },
   });
@@ -385,8 +420,8 @@ async function seedTaskFields(tenantId: string, createdBy: string) {
       createdBy,
     };
   });
-  const created = await prisma.fieldDefinition.createMany({ data: definitions, skipDuplicates: true });
-  const existingLayout = await prisma.pageLayout.findFirst({
+  const created = await tx.fieldDefinition.createMany({ data: definitions, skipDuplicates: true });
+  const existingLayout = await tx.pageLayout.findFirst({
     where: { objectId: object.id, name: 'Default Layout' },
   });
   const rawSections = existingLayout
@@ -395,23 +430,25 @@ async function seedTaskFields(tenantId: string, createdBy: string) {
       : existingLayout.sections) as { name: string; fields: string[] }[]
     : [];
   const sectionName = 'Salesforce Task Fields';
-  const sections = [
-    ...rawSections.filter((section) => section.name !== sectionName),
-    { name: sectionName, fields: definitions.map((field) => field.name) },
-  ];
+  const existingSection = rawSections.find((section) => section.name === sectionName);
+  const sections = existingSection
+    ? rawSections.map((section) => section.name === sectionName
+      ? { ...section, fields: [...new Set([...section.fields, ...definitions.map((field) => field.name)])] }
+      : section)
+    : [...rawSections, { name: sectionName, fields: definitions.map((field) => field.name) }];
   if (existingLayout) {
-    await prisma.pageLayout.update({
+    await tx.pageLayout.update({
       where: { id: existingLayout.id },
-      data: { sections: JSON.stringify(sections), updatedBy: createdBy },
+      data: { sections, updatedBy: createdBy },
     });
   } else {
-    await prisma.pageLayout.create({
+    await tx.pageLayout.create({
       data: {
         tenantId,
         objectId: object.id,
         name: 'Default Layout',
         isDefault: true,
-        sections: JSON.stringify(sections),
+        sections,
         createdBy,
       },
     });
@@ -419,15 +456,15 @@ async function seedTaskFields(tenantId: string, createdBy: string) {
   return created.count;
 }
 
-async function ensureStandardObjects(tenantId: string, createdBy: string) {
+async function ensureStandardObjects(tx: Prisma.TransactionClient, tenantId: string, createdBy: string) {
   for (const object of standardObjects) {
-    const existing = await prisma.objectDefinition.findFirst({
+    const existing = await tx.objectDefinition.findFirst({
       where: { tenantId, name: object.name },
       select: { id: true, isActive: true },
     });
     if (existing) continue;
 
-    const created = await prisma.objectDefinition.create({
+    const created = await tx.objectDefinition.create({
       data: {
         tenantId,
         ...object,
@@ -436,21 +473,21 @@ async function ensureStandardObjects(tenantId: string, createdBy: string) {
         updatedBy: createdBy,
       },
     });
-    await prisma.pageLayout.create({
+    await tx.pageLayout.create({
       data: {
         tenantId,
         objectId: created.id,
         name: 'Default Layout',
         isDefault: true,
-        sections: JSON.stringify([{ name: `${object.label} Information`, fields: [] }]),
+        sections: [{ name: `${object.label} Information`, fields: [] }],
         createdBy,
       },
     });
   }
 }
 
-async function seedCallDetailFields(tenantId: string, createdBy: string) {
-  const object = await prisma.objectDefinition.findFirst({
+async function seedCallDetailFields(tx: Prisma.TransactionClient, tenantId: string, createdBy: string) {
+  const object = await tx.objectDefinition.findFirst({
     where: { tenantId, name: 'CallDetail', isActive: true },
     select: { id: true },
   });
@@ -486,7 +523,7 @@ async function seedCallDetailFields(tenantId: string, createdBy: string) {
     { name: 'status', label: 'Status', fieldType: 'picklist' },
     { name: 'notes', label: 'Notes', fieldType: 'longText' },
   ];
-  await prisma.fieldDefinition.createMany({
+  await tx.fieldDefinition.createMany({
     data: fields.map((field, displayOrder) => ({
       tenantId,
       objectId: object.id,
@@ -511,13 +548,13 @@ async function seedCallDetailFields(tenantId: string, createdBy: string) {
     callType: ['INBOUND', 'OUTBOUND'],
     status: ['COMPLETED', 'NO_ANSWER', 'BUSY', 'VOICEMAIL', 'CANCELLED'],
   })) {
-    const field = await prisma.fieldDefinition.findUnique({
+    const field = await tx.fieldDefinition.findUnique({
       where: { objectId_name: { objectId: object.id, name: fieldName } },
       select: { id: true },
     });
     if (!field) continue;
     for (const [displayOrder, value] of options.entries()) {
-      await prisma.picklistValue.upsert({
+      await tx.picklistValue.upsert({
         where: { fieldId_value: { fieldId: field.id, value } },
         create: {
           tenantId,
@@ -527,11 +564,7 @@ async function seedCallDetailFields(tenantId: string, createdBy: string) {
           isDefault: displayOrder === 0,
           displayOrder,
         },
-        update: {
-          isActive: true,
-          isDefault: displayOrder === 0,
-          displayOrder,
-        },
+        update: {},
       });
     }
   }
@@ -541,46 +574,80 @@ async function seedCallDetailFields(tenantId: string, createdBy: string) {
     { name: 'Related Records', fields: ['caseId', 'createdById', 'lastModifiedById', 'leadId', 'ownerId', 'parentId', 'parentUrl'] },
     { name: 'Details', fields: ['executiveContactNo', 'landingNumber', 'recordingFile', 'notes'] },
   ];
-  await prisma.pageLayout.upsert({
+  const existingLayout = await tx.pageLayout.findUnique({
     where: { objectId_name: { objectId: object.id, name: 'Default Layout' } },
-    create: {
-      tenantId,
-      objectId: object.id,
-      name: 'Default Layout',
-      isDefault: true,
-      sections,
-      createdBy,
-    },
-    update: { isDefault: true, sections },
   });
+  if (!existingLayout) {
+    await tx.pageLayout.create({
+      data: {
+        tenantId,
+        objectId: object.id,
+        name: 'Default Layout',
+        isDefault: true,
+        sections,
+        createdBy,
+      },
+    });
+  } else {
+    const storedSections = (typeof existingLayout.sections === 'string'
+      ? JSON.parse(existingLayout.sections)
+      : existingLayout.sections) as Array<{ name: string; fields?: string[] }>;
+    const mergedSections = Array.isArray(storedSections) ? [...storedSections] : [];
+    for (const section of sections) {
+      const existing = mergedSections.find((candidate) => candidate.name === section.name);
+      if (existing) {
+        existing.fields = [...new Set([...(existing.fields ?? []), ...section.fields])];
+      } else {
+        mergedSections.push(section);
+      }
+    }
+    await tx.pageLayout.update({
+      where: { id: existingLayout.id },
+      data: { sections: mergedSections, updatedBy: createdBy },
+    });
+  }
+}
+
+export async function seedSalesforceMetadataForTenant(
+  tx: Prisma.TransactionClient,
+  tenantId: string,
+  createdBy: string,
+) {
+  await ensureStandardObjects(tx, tenantId, createdBy);
+  await seedCallDetailFields(tx, tenantId, createdBy);
+  const [leadCount, enquiryCount, siteVisitCount, taskCount] = await Promise.all([
+    seedObjectFields(tx, tenantId, createdBy, 'Lead', leadFields),
+    seedEnquiryFieldsInTransaction(tx, tenantId, createdBy),
+    seedObjectFields(tx, tenantId, createdBy, 'SiteVisit', siteVisitFields),
+    seedTaskFields(tx, tenantId, createdBy),
+  ]);
+  return { leadCount, enquiryCount, siteVisitCount, taskCount };
 }
 
 async function main() {
-  const tenants = await prisma.tenant.findMany({
+  const prisma = new PrismaClient();
+  try {
+    const tenants = await prisma.tenant.findMany({
     where: { isActive: true },
     select: { id: true, name: true },
   });
 
-  for (const tenant of tenants) {
-    const user = await prisma.user.findFirst({
-      where: { tenantId: tenant.id, isActive: true },
-      orderBy: { createdAt: 'asc' },
-      select: { id: true },
-    });
-    if (!user) {
-      console.warn(`Skipping ${tenant.name}: no active user is available for metadata ownership.`);
-      continue;
-    }
+    for (const tenant of tenants) {
+      const user = await prisma.user.findFirst({
+        where: { tenantId: tenant.id, isActive: true },
+        orderBy: { createdAt: 'asc' },
+        select: { id: true },
+      });
+      if (!user) {
+        console.warn(`Skipping ${tenant.name}: no active user is available for metadata ownership.`);
+        continue;
+      }
 
-    await ensureStandardObjects(tenant.id, user.id);
-    await seedCallDetailFields(tenant.id, user.id);
-    const [leadCount, enquiryCount, siteVisitCount, taskCount] = await Promise.all([
-      seedObjectFields(tenant.id, user.id, 'Lead', leadFields),
-      seedEnquiryFields(tenant.id, user.id),
-      seedObjectFields(tenant.id, user.id, 'SiteVisit', siteVisitFields),
-      seedTaskFields(tenant.id, user.id),
-    ]);
-    console.log(`${tenant.name}: created ${leadCount} Lead, ${enquiryCount} Enquiry, ${siteVisitCount} Site Visit, and ${taskCount} Task fields.`);
+      const counts = await prisma.$transaction((tx) => seedSalesforceMetadataForTenant(tx, tenant.id, user.id));
+      console.log(`${tenant.name}: created ${counts.leadCount} Lead, ${counts.enquiryCount} Enquiry, ${counts.siteVisitCount} Site Visit, and ${counts.taskCount} Task fields.`);
+    }
+  } finally {
+    await prisma.$disconnect();
   }
 }
 
@@ -590,8 +657,5 @@ if (seedEntry.includes('seed-salesforce-fields')) {
     .catch((error) => {
       console.error('Salesforce field seed failed:', error);
       process.exitCode = 1;
-    })
-    .finally(async () => {
-      await prisma.$disconnect();
     });
 }

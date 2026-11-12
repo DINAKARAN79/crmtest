@@ -1,5 +1,10 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Prisma } from '@prisma/client';
+import {
+  seedLeadFieldsForTenant,
+  seedSalesforceMetadataForTenant,
+  seedUnitFieldsForTenant,
+} from '@dct-crm/db';
 import { bootstrapTenant } from './tenantBootstrap';
 
 describe('bootstrapTenant', () => {
@@ -22,6 +27,7 @@ describe('bootstrapTenant', () => {
         seededObjects.push(...data.map((object: { name: string; label: string }, index: number) => ({
           ...object,
           id: `object-${index}`,
+          isActive: true,
         })));
         return Promise.resolve({ count: data.length });
       }),
@@ -32,8 +38,11 @@ describe('bootstrapTenant', () => {
     },
     fieldDefinition: {
       createMany: vi.fn().mockResolvedValue({ count: 0 }),
+      create: vi.fn().mockResolvedValue({ id: 'created-field' }),
       updateMany: vi.fn().mockResolvedValue({ count: 0 }),
       deleteMany: vi.fn().mockResolvedValue({ count: 0 }),
+      findMany: vi.fn().mockResolvedValue([]),
+      findUnique: vi.fn().mockResolvedValue(null),
       findFirst: vi.fn(async ({ where }: { where?: { name?: string } }) => (
         where?.name === 'bookingStage'
           ? { id: 'stage-field', required: true }
@@ -63,12 +72,17 @@ describe('bootstrapTenant', () => {
       findFirst: vi.fn().mockResolvedValue(null),
       create: vi.fn().mockResolvedValue({ id: 'companies-api-record' }),
     },
-    picklistValue: { createMany: vi.fn().mockResolvedValue({ count: 6 }) },
+    picklistValue: {
+      createMany: vi.fn().mockResolvedValue({ count: 6 }),
+      upsert: vi.fn().mockResolvedValue({}),
+    },
     pageLayout: {
       findMany: vi.fn().mockResolvedValue([]),
-      findFirst: vi.fn().mockResolvedValue({ id: 'existing-layout' }),
+      findFirst: vi.fn().mockResolvedValue({ id: 'existing-layout', sections: [] }),
+      findUnique: vi.fn().mockResolvedValue({ id: 'existing-layout', sections: [] }),
       createMany: vi.fn().mockResolvedValue({ count: 10 }),
       create: vi.fn().mockResolvedValue({ id: 'user-layout' }),
+      update: vi.fn().mockResolvedValue({ id: 'existing-layout' }),
     },
     profile: {
       upsert: vi.fn()
@@ -103,6 +117,9 @@ describe('bootstrapTenant', () => {
   it('bootstraps supported CRM objects and excludes removed workflow permissions', async () => {
     const result = await bootstrapTenant(tx, 'new-tenant', 'creator');
 
+    expect(seedSalesforceMetadataForTenant).toHaveBeenCalledWith(tx, 'new-tenant', 'creator');
+    expect(seedLeadFieldsForTenant).toHaveBeenCalledWith(tx, 'new-tenant', 'creator');
+    expect(seedUnitFieldsForTenant).toHaveBeenCalledWith(tx, 'new-tenant', 'creator');
     expect(result).toEqual({
       adminProfileId: 'admin-profile',
       adminRoleId: 'admin-role',
@@ -148,6 +165,7 @@ describe('bootstrapTenant', () => {
       'Company',
       'CompaniesAPI',
       'FollowUp',
+      'Task',
       'Activity',
       'CallDetail',
       'User',

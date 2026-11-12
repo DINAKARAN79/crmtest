@@ -44,11 +44,18 @@ Tenant analytics currently compares per-company lead counts. Platform overview
 booking values and approved CRM payment collections are shown separately and by
 tenant currency; they are not combined into a single revenue figure.
 
-Apply the additive platform reporting migration before using these APIs:
+Use the Prisma schema to create an empty development database. The repository's
+existing migration history contains incomplete and failed entries; do not use
+`prisma migrate deploy` as a fresh-clone setup or as a recovery shortcut. A
+reviewed production migration/reconciliation path is still required before
+deploying schema changes to an existing database.
 
-```bash
-npx prisma migrate deploy --schema packages/db/prisma/schema.prisma
-```
+For an existing database, first take a verified backup and inspect migration
+state with `npx prisma migrate status --schema packages/db/prisma/schema.prisma`.
+If Prisma reports applied migrations missing from this checkout, pending
+migrations after a failed migration, or a history mismatch, stop: do not run
+`migrate deploy`, `migrate resolve`, or `db push` until the physical schema and
+migration ledger have been reconciled for that database.
 
 ## Getting Started
 
@@ -56,12 +63,12 @@ npx prisma migrate deploy --schema packages/db/prisma/schema.prisma
 # Install dependencies
 npm install
 
-# Set up database
-cd packages/db
-npx prisma db push
-npx ts-node src/seed-super-admin.ts
-npx ts-node src/seed.ts
-npx ts-node src/seed-lead-fields.ts
+# Set up an empty local/development database
+npm run db:generate
+npm run db:push
+npm run db:seed-super-admin
+npm run db:seed
+npm run db:seed:standard-metadata
 
 # Start API server
 cd apps/api
@@ -71,6 +78,11 @@ npm run dev
 cd apps/web
 npm run dev
 ```
+
+`db:push` is for an empty local/development database, not for production
+upgrades. `db:seed:standard-metadata` additively fills missing standard Lead,
+Salesforce, and Unit metadata for active tenants. It preserves existing field
+definitions, picklist choices, layout sections, and tenant data.
 
 ## Login Credentials
 

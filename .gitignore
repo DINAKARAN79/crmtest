@@ -24,12 +24,10 @@ build/
 # Testing
 coverage/
 
-# Environment
+# Environment (secrets)
 .env
-.env.local
-.env.development.local
-.env.test.local
-.env.production.local
+.env.*
+!.env.example
 
 # Debug
 npm-debug.log*
@@ -47,12 +45,16 @@ yarn-error.log*
 .DS_Store
 Thumbs.db
 
-# Prisma
 # Python
 apps/ai/__pycache__/
 apps/ai/**/*.pyc
 apps/ai/.venv/
 apps/ai/venv/
+
+# Database files (may contain real data)
+*.sqlite
+*.sqlite3
+*.db
 
 # Misc
 *.log

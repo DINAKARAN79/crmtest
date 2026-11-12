@@ -1,5 +1,10 @@
 import type { Prisma } from '@prisma/client';
 import { BOOKING_FIELDS, BOOKING_STAGE_OPTIONS, BOOKING_OBJECT, bookingLayoutSections } from '@dct-crm/shared';
+import {
+  seedLeadFieldsForTenant,
+  seedSalesforceMetadataForTenant,
+  seedUnitFieldsForTenant,
+} from '@dct-crm/db';
 import { REPORT_OBJECTS, type ReportFieldType } from '../reports/report-metadata';
 import { ensureUserObject } from './userObject';
 import { DEFAULT_ADMIN_PERMISSION_NAMES, REQUIRED_PERMISSION_NAMES } from './requiredPermissionCatalog';
@@ -14,6 +19,7 @@ const STANDARD_OBJECTS = [
   { name: 'Company', label: 'Company', pluralLabel: 'Companies', icon: 'building', description: 'Manage companies' },
   { name: 'CompaniesAPI', label: 'Companies API', pluralLabel: 'Companies API', icon: 'network', description: 'Company API data and related CRM records', isAvailableInNavigation: false },
   { name: 'FollowUp', label: 'Follow-up', pluralLabel: 'Follow-ups', icon: 'phone', description: 'Manage lead follow-ups' },
+  { name: 'Task', label: 'Task', pluralLabel: 'Tasks', icon: 'check-square', description: 'Task management' },
   { name: 'Activity', label: 'Activity', pluralLabel: 'Activities', icon: 'activity', description: 'Track CRM activities' },
   { name: 'CallDetail', label: 'Call Detail', pluralLabel: 'Call Details', icon: 'phone', description: 'Track inbound and outbound calls', isAvailableInNavigation: false },
   { name: 'User', label: 'Users', pluralLabel: 'Users', icon: 'users', description: 'Manage CRM users and their profiles', isAvailableInNavigation: false, isAvailableInReports: false },
@@ -430,6 +436,9 @@ export async function bootstrapTenant(
   });
 
   await ensureUserObject(tx, tenantId, actorId);
+  await seedSalesforceMetadataForTenant(tx, tenantId, actorId);
+  await seedLeadFieldsForTenant(tx, tenantId, actorId);
+  await seedUnitFieldsForTenant(tx, tenantId, actorId);
 
   return {
     adminProfileId: adminProfile.id,
