@@ -4,6 +4,7 @@ import * as React from "react";
 import Link from "next/link";
 import { usePathname, useSearchParams } from "next/navigation";
 import { cn } from "@/lib/utils";
+import { CRM_SIDEBAR_ITEMS } from "@dct-crm/shared";
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { useAuth } from "@/contexts/auth-context";
@@ -42,7 +43,8 @@ export function getNavigationByProfile(
   roles: string[],
   hasEffectivePermission: (perm: string) => boolean,
   isSuperAdmin: boolean,
-  isAdmin: boolean
+  isAdmin: boolean,
+  sidebarAccess?: string[] | null,
 ): NavItem[] {
   void roles;
 
@@ -99,7 +101,14 @@ export function getNavigationByProfile(
     nav.push({ title: "Setup", href: "/setup", icon: Settings });
   }
 
-  return nav;
+  if (!sidebarAccess) return nav;
+  const allowedItems = new Set(sidebarAccess);
+  return nav.filter((item) => {
+    const sidebarItem = CRM_SIDEBAR_ITEMS.find((candidate) => candidate.href === item.href);
+    return !sidebarItem
+      || allowedItems.has(sidebarItem.id)
+      || sidebarItem.id === "home";
+  });
 }
 
 export function Sidebar({ isOpen, onClose }: SidebarProps) {
@@ -141,7 +150,8 @@ export function Sidebar({ isOpen, onClose }: SidebarProps) {
     roles,
     hasEffectivePermission,
     isSuperAdmin,
-    isAdmin
+    isAdmin,
+    profile?.sidebarAccess,
   );
 
   const isActive = (href: string) => {

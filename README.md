@@ -176,9 +176,9 @@ dct-crm/
 Manual Lead creation is processed by the backend `processLeadEnquiry` service.
 It validates contact data, checks for duplicates inside the create transaction,
 and only sends a genuinely new Lead through the existing assignment workflow.
-A single match is retained as the Main Lead and receives a source-specific
-`Enquiry` record; multiple matches are returned as an ambiguous conflict for
-review rather than selecting a Lead arbitrarily. This repository does not
+An exact phone match is linked to the oldest matching Lead and receives a
+source-specific `Enquiry` record; unresolved country-code ambiguity and
+multiple email-only matches are returned as conflicts for review. This repository does not
 contain Salesforce `SLeadTrigger` or `RelatedSourceHandler.duplicateCheck2()`
 source code; the equivalent source-history model here is `Enquiry`.
 

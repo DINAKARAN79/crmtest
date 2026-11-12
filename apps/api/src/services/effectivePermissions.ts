@@ -7,6 +7,7 @@ export interface EffectivePermission {
   action: string;
   source: 'PROFILE' | 'PERMISSION_SET' | 'PERMISSION_SET_GROUP' | 'DIRECT' | 'ROLE';
   sourceName: string;
+  expiresAt?: Date | null;
 }
 
 export interface EffectiveFieldPermission {
@@ -27,6 +28,11 @@ export interface PermissionCheckResult {
 const FULL_SYSTEM_ACCESS = 'FULL_SYSTEM_ACCESS';
 
 type PermissionCacheBag = Map<string, { revision: number; permissions: Promise<EffectivePermission[]> }>;
+type GlobalPermissionCacheEntry = {
+  revision: number;
+  expiresAt: number;
+  permissions: Promise<EffectivePermission[]>;
+};
 
 export class EffectivePermissionService {
   /**
@@ -36,7 +42,9 @@ export class EffectivePermissionService {
    * cross-request staleness.
    */
   private static readonly requestCaches = new WeakMap<object, PermissionCacheBag>();
+  private static readonly permissionCache = new Map<string, GlobalPermissionCacheEntry>();
   private static permissionCacheRevision = 0;
+  private static readonly permissionCacheTtlMs = 60_000;
   private static telephonyPermissionWarningLogged = false;
 
   static getEffectivePermissionsCached(owner: object, userId: string): Promise<EffectivePermission[]> {
@@ -49,7 +57,7 @@ export class EffectivePermissionService {
     if (!cached || cached.revision !== this.permissionCacheRevision) {
       cached = {
         revision: this.permissionCacheRevision,
-        permissions: this.getEffectivePermissions(userId),
+        permissions: this.getCachedEffectivePermissions(userId),
       };
       bag.set(userId, cached);
     }
@@ -57,7 +65,36 @@ export class EffectivePermissionService {
   }
 
   static invalidateUserPermissionsCache(userIds: string[]) {
-    if (userIds.length) this.permissionCacheRevision += 1;
+    if (!userIds.length) return;
+    this.permissionCacheRevision += 1;
+    for (const userId of userIds) this.permissionCache.delete(userId);
+  }
+
+  private static getCachedEffectivePermissions(userId: string): Promise<EffectivePermission[]> {
+    const now = Date.now();
+    const cached = this.permissionCache.get(userId);
+    if (cached && cached.revision === this.permissionCacheRevision && cached.expiresAt > now) {
+      return cached.permissions;
+    }
+
+    const permissions = this.getEffectivePermissions(userId);
+    const entry: GlobalPermissionCacheEntry = {
+      revision: this.permissionCacheRevision,
+      expiresAt: now + this.permissionCacheTtlMs,
+      permissions,
+    };
+    this.permissionCache.set(userId, entry);
+    void permissions.then((resolved) => {
+      if (this.permissionCache.get(userId) !== entry) return;
+      const nextExpiry = resolved.reduce<number | null>((earliest, permission) => {
+        const expiry = permission.expiresAt?.getTime();
+        return expiry && expiry > now && (earliest === null || expiry < earliest) ? expiry : earliest;
+      }, null);
+      entry.expiresAt = Math.min(now + this.permissionCacheTtlMs, nextExpiry ?? Number.POSITIVE_INFINITY);
+    }).catch(() => {
+      if (this.permissionCache.get(userId) === entry) this.permissionCache.delete(userId);
+    });
+    return permissions;
   }
 
   static async isTelephonyPermissionConfigured(): Promise<boolean> {
@@ -122,8 +159,45 @@ export class EffectivePermissionService {
     if (deduplicated.some((p) => p.name === FULL_SYSTEM_ACCESS)) {
       return this.applyTelephonyAgentOverride(userId, user.tenantId, await this.getAllSystemPermissions());
     }
-
     return this.applyTelephonyAgentOverride(userId, user.tenantId, deduplicated);
+  }
+
+  static async canViewAll(userId: string, objectName: string): Promise<boolean> {
+    const permissions = await this.getCachedEffectivePermissions(userId);
+    const object = objectName.replace(/([a-z])([A-Z])/g, '$1_$2').toUpperCase();
+    return this.hasPermissionIn(permissions, `${object}_READ`) &&
+      this.hasPermissionIn(permissions, `${object}_VIEW_ALL`);
+  }
+
+  static async canEditAll(userId: string, objectName: string): Promise<boolean> {
+    const permissions = await this.getCachedEffectivePermissions(userId);
+    const object = objectName.replace(/([a-z])([A-Z])/g, '$1_$2').toUpperCase();
+    return this.hasPermissionIn(permissions, `${object}_READ`) &&
+      this.hasPermissionIn(permissions, `${object}_UPDATE`) &&
+      this.hasPermissionIn(permissions, `${object}_EDIT_ALL`);
+  }
+
+  static async getLeadAllAccess(userId: string) {
+    const permissions = await this.getCachedEffectivePermissions(userId);
+    const hasRead = this.hasPermissionIn(permissions, 'LEAD_READ');
+    const hasUpdate = this.hasPermissionIn(permissions, 'LEAD_UPDATE');
+    const grantsBySource = new Map<string, { sourceName: string; canViewAll: true; canEditAll: boolean }>();
+    for (const permission of permissions) {
+      if (permission.name !== 'LEAD_VIEW_ALL' && permission.name !== 'LEAD_EDIT_ALL') continue;
+      const grant = grantsBySource.get(permission.sourceName) ?? {
+        sourceName: permission.sourceName,
+        canViewAll: true as const,
+        canEditAll: false,
+      };
+      grant.canEditAll ||= permission.name === 'LEAD_EDIT_ALL';
+      grantsBySource.set(permission.sourceName, grant);
+    }
+    const viewGrants = Array.from(grantsBySource.values());
+    return {
+      viewAll: hasRead && viewGrants.length > 0,
+      editAll: hasRead && hasUpdate && viewGrants.some((grant) => grant.canEditAll),
+      sources: viewGrants,
+    };
   }
 
   private static async applyTelephonyAgentOverride(userId: string, tenantId: string, permissions: EffectivePermission[]) {
@@ -159,7 +233,8 @@ export class EffectivePermissionService {
       }));
     }
 
-    const [profilePermissions, permissionSetAssignments, roleAssignments] = await Promise.all([
+    const activeSets = { OR: [{ expiresAt: null }, { expiresAt: { gt: new Date() } }] };
+    const [profilePermissions, permissionSetAssignments, profilePermissionSetAssignments, roleAssignments] = await Promise.all([
       user.profileId
         ? prisma.profileFieldPermission.findMany({
             where: {
@@ -173,7 +248,7 @@ export class EffectivePermissionService {
       prisma.userPermissionAssignment.findMany({
         where: {
           userId,
-          permissionSet: { tenantId: user.tenantId, isActive: true },
+          permissionSet: { tenantId: user.tenantId, isActive: true, ...activeSets },
         },
         include: {
           permissionSet: {
@@ -186,6 +261,24 @@ export class EffectivePermissionService {
           },
         },
       }),
+      user.profileId
+        ? prisma.profilePermissionSetAssignment.findMany({
+            where: {
+              profileId: user.profileId,
+              permissionSet: { tenantId: user.tenantId, isActive: true, ...activeSets },
+            },
+            include: {
+              permissionSet: {
+                include: {
+                  fieldPermissions: {
+                    where: { field: { tenantId: user.tenantId, objectId } },
+                    include: { field: { select: { id: true, name: true } } },
+                  },
+                },
+              },
+            },
+          })
+        : Promise.resolve([]),
       prisma.userRole.findMany({
         where: { userId, role: { tenantId: user.tenantId } },
         include: {
@@ -229,6 +322,21 @@ export class EffectivePermissionService {
       }
     }
 
+    for (const assignment of profilePermissionSetAssignments) {
+      for (const permission of assignment.permissionSet.fieldPermissions) {
+        const existing = merged.get(permission.field.id);
+        const next: EffectiveFieldPermission = {
+          fieldId: permission.field.id,
+          fieldName: permission.field.name,
+          canRead: (existing?.canRead ?? false) || permission.canRead,
+          canEdit: (existing?.canEdit ?? false) || permission.canEdit,
+          source: permission.canRead || permission.canEdit ? 'PERMISSION_SET' : existing?.source ?? 'PROFILE',
+          sourceName: assignment.permissionSet.name,
+        };
+        merged.set(permission.field.id, next);
+      }
+    }
+
     for (const userRole of roleAssignments) {
       for (const permission of userRole.role.fieldPerms) {
         const existing = merged.get(permission.field.id);
@@ -250,7 +358,7 @@ export class EffectivePermissionService {
   static async getProfilePermissions(profileId: string | null, tenantId?: string): Promise<EffectivePermission[]> {
     if (!profileId) return [];
 
-    const [profilePerms, objectPerms, profilePermissionSets] = await Promise.all([
+    const [profilePerms, objectPerms, profilePermissionSets, assignedPermissionSets] = await Promise.all([
       prisma.userProfilePermission.findMany({
         where: {
           profileId,
@@ -265,6 +373,24 @@ export class EffectivePermissionService {
       }),
       prisma.permissionSet.findMany({
         where: { profileId, ...(tenantId ? { tenantId } : {}) },
+      }),
+      prisma.profilePermissionSetAssignment.findMany({
+        where: {
+          profileId,
+          permissionSet: {
+            isActive: true,
+            OR: [{ expiresAt: null }, { expiresAt: { gt: new Date() } }],
+            ...(tenantId ? { tenantId } : {}),
+          },
+        },
+        include: {
+          permissionSet: {
+            include: {
+              items: { where: { permission: { isActive: true } }, include: { permission: true } },
+              objectPermissions: { include: { object: { select: { name: true, isActive: true } } } },
+            },
+          },
+        },
       }),
     ]);
 
@@ -302,12 +428,35 @@ export class EffectivePermissionService {
       ...namedPermissions,
       ...this.objectPermissionsToEffective(objectPerms, 'PROFILE', 'Profile'),
       ...legacyPermissionSetPermissions,
+      ...assignedPermissionSets.flatMap(({ permissionSet }) => [
+        ...permissionSet.items.map(({ permission }) => ({
+          name: permission.name,
+          module: permission.module,
+          action: permission.action,
+          source: 'PERMISSION_SET' as const,
+          sourceName: permissionSet.name,
+          expiresAt: permissionSet.expiresAt,
+        })),
+        ...this.objectPermissionsToEffective(
+          permissionSet.objectPermissions.filter((item) => item.object.isActive),
+          'PERMISSION_SET',
+          permissionSet.name,
+          permissionSet.expiresAt,
+        ),
+      ]),
     ];
   }
 
   static async getPermissionSetPermissions(userId: string, tenantId?: string): Promise<EffectivePermission[]> {
     const assignments = await prisma.userPermissionAssignment.findMany({
-      where: { userId, permissionSet: { isActive: true, ...(tenantId ? { tenantId } : {}) } },
+      where: {
+        userId,
+        permissionSet: {
+          isActive: true,
+          OR: [{ expiresAt: null }, { expiresAt: { gt: new Date() } }],
+          ...(tenantId ? { tenantId } : {}),
+        },
+      },
       include: {
         permissionSet: {
           include: {
@@ -330,6 +479,7 @@ export class EffectivePermissionService {
           action: item.permission.action,
           source: 'PERMISSION_SET',
           sourceName: assignment.permissionSet.name,
+          expiresAt: assignment.permissionSet.expiresAt,
         });
       }
     }
@@ -338,6 +488,7 @@ export class EffectivePermissionService {
         assignment.permissionSet.objectPermissions.filter((item) => item.object.isActive),
         'PERMISSION_SET',
         assignment.permissionSet.name,
+        assignment.permissionSet.expiresAt,
       ));
     }
     return perms;
@@ -370,7 +521,11 @@ export class EffectivePermissionService {
     const perms: EffectivePermission[] = [];
     for (const assignment of assignments) {
       for (const groupItem of assignment.group.assignments) {
-        if (!groupItem.permissionSet.isActive || (tenantId && groupItem.permissionSet.tenantId !== tenantId)) continue;
+        if (
+          !groupItem.permissionSet.isActive ||
+          (groupItem.permissionSet.expiresAt && groupItem.permissionSet.expiresAt <= new Date()) ||
+          (tenantId && groupItem.permissionSet.tenantId !== tenantId)
+        ) continue;
         for (const item of groupItem.permissionSet.items) {
           perms.push({
             name: item.permission.name,
@@ -378,12 +533,14 @@ export class EffectivePermissionService {
             action: item.permission.action,
             source: 'PERMISSION_SET_GROUP',
             sourceName: assignment.group.name,
+            expiresAt: groupItem.permissionSet.expiresAt,
           });
         }
         perms.push(...this.objectPermissionsToEffective(
           groupItem.permissionSet.objectPermissions.filter((item) => item.object.isActive),
           'PERMISSION_SET_GROUP',
-          assignment.group.name,
+          groupItem.permissionSet.name,
+          groupItem.permissionSet.expiresAt,
         ));
       }
     }
@@ -391,9 +548,20 @@ export class EffectivePermissionService {
   }
 
   private static objectPermissionsToEffective(
-    objectPermissions: Array<{ object: { name: string }; canCreate: boolean; canRead: boolean; canUpdate: boolean; canDelete: boolean; viewAll: boolean; modifyAll: boolean }>,
+    objectPermissions: Array<{
+      object: { name: string };
+      canCreate: boolean;
+      canRead: boolean;
+      canUpdate: boolean;
+      canDelete: boolean;
+      viewAll: boolean;
+      modifyAll: boolean;
+      canViewAll?: boolean;
+      canEditAll?: boolean;
+    }>,
     source: 'PROFILE' | 'PERMISSION_SET' | 'PERMISSION_SET_GROUP',
     sourceName: string,
+    expiresAt?: Date | null,
   ): EffectivePermission[] {
     const actionMap = [
       ['canCreate', 'CREATE'],
@@ -402,13 +570,15 @@ export class EffectivePermissionService {
       ['canDelete', 'DELETE'],
       ['viewAll', 'VIEW_ALL'],
       ['modifyAll', 'MODIFY_ALL'],
+      ['canViewAll', 'VIEW_ALL'],
+      ['canEditAll', 'EDIT_ALL'],
     ] as const;
 
     return objectPermissions.flatMap((permission) => {
       const module = permission.object.name.replace(/([a-z])([A-Z])/g, '$1_$2').toUpperCase();
       return actionMap
         .filter(([key]) => permission[key])
-        .map(([, action]) => ({ name: `${module}_${action}`, module, action, source, sourceName }));
+        .map(([, action]) => ({ name: `${module}_${action}`, module, action, source, sourceName, expiresAt }));
     });
   }
 
@@ -522,6 +692,7 @@ export class EffectivePermissionService {
 
   static async getUserPermissionsSummary(userId: string) {
     const effective = await this.getEffectivePermissions(userId);
+    const leadAllAccess = await this.getLeadAllAccess(userId);
 
     const byModule: Record<string, EffectivePermission[]> = {};
     for (const perm of effective) {
@@ -534,6 +705,7 @@ export class EffectivePermissionService {
       byModule,
       total: effective.length,
       hasFullAccess: effective.some((p) => p.name === FULL_SYSTEM_ACCESS),
+      leadAllAccess,
     };
   }
 }

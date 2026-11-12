@@ -6,6 +6,7 @@ import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { FileBarChart2, Folder, FolderOpen, Loader2, MoreHorizontal, Plus, RefreshCw, Search, X } from "lucide-react";
 import { CommonFilterPanel, FilterSearch } from "@/components/crm/common-filter-panel";
 import { Button } from "@/components/ui/button";
+import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
 import { exportReportCsv } from "@/lib/report-export";
 import { useAuth } from "@/contexts/auth-context";
 import { companyApi } from "@/lib/api";
@@ -84,11 +85,14 @@ function ReportsContent() {
   const [companies, setCompanies] = React.useState<CompanyOption[]>([]);
   const [createTenantId, setCreateTenantId] = React.useState("");
   const createCompanyId = isSuperAdmin ? createTenantId : tenant?.id || "";
-  const [activeMenu, setActiveMenu] = React.useState<string | null>(null);
-  const [folderMenu, setFolderMenu] = React.useState<string | null>(null);
   const [movingReport, setMovingReport] = React.useState<Report | null>(null);
   const [showFolderModal, setShowFolderModal] = React.useState(false);
   const [showMoveModal, setShowMoveModal] = React.useState(false);
+  const [moveFolderSearch, setMoveFolderSearch] = React.useState("");
+  const [moveFolders, setMoveFolders] = React.useState<ReportFolder[]>([]);
+  const [moveFoldersLoading, setMoveFoldersLoading] = React.useState(false);
+  const [moveError, setMoveError] = React.useState("");
+  const [movingToFolder, setMovingToFolder] = React.useState(false);
   const [folderName, setFolderName] = React.useState("");
   const [folderUniqueName, setFolderUniqueName] = React.useState("");
   const [folderError, setFolderError] = React.useState("");
@@ -206,7 +210,43 @@ function ReportsContent() {
   React.useEffect(() => { const timer = window.setTimeout(() => void loadReports(), 350); return () => window.clearTimeout(timer); }, [loadReports]);
   React.useEffect(() => { setReportPage(1); }, [search, view, selectedFolderId, folderViewParam]);
   React.useEffect(() => { void loadFolders(); }, [loadFolders]);
-  React.useEffect(() => { const close = () => setActiveMenu(null); window.addEventListener("click", close); return () => window.removeEventListener("click", close); }, []);
+  React.useEffect(() => {
+    if (!showMoveModal || !movingReport) return;
+    let active = true;
+    const timer = window.setTimeout(() => {
+      void (async () => {
+        try {
+          setMoveFoldersLoading(true);
+          setMoveError("");
+          const params = new URLSearchParams({ view: "all" });
+          const folderQuery = moveFolderSearch.trim();
+          if (folderQuery) params.set("search", folderQuery);
+          if (isSuperAdmin) params.set("scope", "allCompanies");
+          const data = await readResponse<ReportFolder[]>(
+            await fetch(`/api/proxy/api/report-folders?${params}`, { cache: "no-store" }),
+          );
+          if (active) {
+            setMoveFolders(
+              (Array.isArray(data) ? data : []).filter(
+                (folder) => folder.tenantId === movingReport.tenantId,
+              ),
+            );
+          }
+        } catch (err) {
+          if (active) {
+            setMoveFolders([]);
+            setMoveError(err instanceof Error ? err.message : "Unable to load folders");
+          }
+        } finally {
+          if (active) setMoveFoldersLoading(false);
+        }
+      })();
+    }, 200);
+    return () => {
+      active = false;
+      window.clearTimeout(timer);
+    };
+  }, [isSuperAdmin, moveFolderSearch, movingReport, showMoveModal]);
 
   const deleteReport = async (report: Report) => {
     if (!window.confirm(`Delete "${report.name}"?`)) return;
@@ -226,7 +266,6 @@ function ReportsContent() {
       const method = report.isFavorite ? "DELETE" : "POST";
       await readResponse(await fetch(withTenantId(`/api/proxy/api/reports/${report.id}/favorite`, report.tenantId), { method }));
       setReports((current) => current.map((item) => item.id === report.id ? { ...item, isFavorite: !report.isFavorite } : item).filter((item) => view !== "favorites" || item.isFavorite));
-      setActiveMenu(null);
     } catch (err) { setError(err instanceof Error ? err.message : "Unable to update favorite"); }
   };
 
@@ -235,7 +274,6 @@ function ReportsContent() {
       const method = folder.isFavorite ? "DELETE" : "POST";
       await readResponse(await fetch(withTenantId(`/api/proxy/api/report-folders/${folder.id}/favorite`, folder.tenantId), { method }));
       setFolders((current) => current.map((item) => item.id === folder.id ? { ...item, isFavorite: !folder.isFavorite } : item).filter((item) => folderView !== "favorites" || item.isFavorite));
-      setFolderMenu(null);
     } catch (err) { setError(err instanceof Error ? err.message : "Unable to update favorite"); }
   };
 
@@ -273,11 +311,17 @@ function ReportsContent() {
   };
 
   const moveReport = async (folderId: string | null) => {
-    if (!movingReport) return;
+    if (!movingReport || movingToFolder) return;
     try {
+      setMovingToFolder(true);
+      setMoveError("");
       await readResponse(await fetch(withTenantId(`/api/proxy/api/reports/${movingReport.id}/move`, movingReport.tenantId), { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ folderId }) }));
       setShowMoveModal(false); setMovingReport(null); void loadReports(); void loadFolders();
-    } catch (err) { window.alert(err instanceof Error ? err.message : "Unable to move report"); }
+    } catch (err) {
+      setMoveError(err instanceof Error ? err.message : "Unable to move report");
+    } finally {
+      setMovingToFolder(false);
+    }
   };
 
   const navigateTo = (params: Record<string, string | null>) => {
@@ -293,7 +337,6 @@ function ReportsContent() {
     if (!window.confirm(`Delete "${folder.name}"? Reports inside will be kept.`)) return;
     try {
       await readResponse(await fetch(withTenantId(`/api/proxy/api/report-folders/${folder.id}`, folder.tenantId), { method: "DELETE" }));
-      setFolderMenu(null);
       void loadFolders();
     } catch (err) { window.alert(err instanceof Error ? err.message : "Unable to delete folder"); }
   };
@@ -303,7 +346,6 @@ function ReportsContent() {
     if (!name || name === folder.name) return;
     try {
       await readResponse(await fetch(withTenantId(`/api/proxy/api/report-folders/${folder.id}`, folder.tenantId), { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name }) }));
-      setFolderMenu(null);
       void loadFolders();
     } catch (err) { window.alert(err instanceof Error ? err.message : "Unable to rename folder"); }
   };
@@ -379,13 +421,42 @@ function ReportsContent() {
         </button>
 
       </aside>
-      <main className="min-w-0 flex-1">{error && <div className="m-4 rounded-md border border-destructive/30 bg-destructive/10 p-3 text-sm text-destructive">{error}</div>}{isFoldersPage ? <FolderTable folders={folders} folderMenu={folderMenu} onMenuChange={setFolderMenu} onOpen={(folder) => navigateTo({ section: null, view: "all", folderView: null, folderId: folder.id })} onRename={(folder) => void renameFolder(folder)} onDelete={(folder) => void deleteFolder(folder)} onFavorite={(folder) => void toggleFolderFavorite(folder)} /> : <div className="overflow-x-auto"><table className="w-full min-w-0 text-left text-sm"><thead><tr className="border-b border-sky-100 bg-sky-50 text-[#1479a8]"><th className="px-4 py-3 font-semibold">Report Name</th>{isSuperAdmin && <th className="px-4 py-3 font-semibold">Company</th>}<th className="px-4 py-3 font-semibold">Description</th><th className="px-4 py-3 font-semibold">Folder</th><th className="px-4 py-3 font-semibold">Created By</th><th className="px-4 py-3 font-semibold">Created On</th><th className="w-16 px-4 py-3" /></tr></thead><tbody>
+      <main className="min-w-0 flex-1">{error && <div className="m-4 rounded-md border border-destructive/30 bg-destructive/10 p-3 text-sm text-destructive">{error}</div>}{isFoldersPage ? <FolderTable folders={folders} onOpen={(folder) => navigateTo({ section: null, view: "all", folderView: null, folderId: folder.id })} onRename={(folder) => void renameFolder(folder)} onDelete={(folder) => void deleteFolder(folder)} onFavorite={(folder) => void toggleFolderFavorite(folder)} /> : <div className="overflow-x-auto"><table className="w-full min-w-0 text-left text-sm"><thead><tr className="border-b border-sky-100 bg-sky-50 text-[#1479a8]"><th className="px-4 py-3 font-semibold">Report Name</th>{isSuperAdmin && <th className="px-4 py-3 font-semibold">Company</th>}<th className="px-4 py-3 font-semibold">Description</th><th className="px-4 py-3 font-semibold">Folder</th><th className="px-4 py-3 font-semibold">Created By</th><th className="px-4 py-3 font-semibold">Created On</th><th className="w-16 px-4 py-3" /></tr></thead><tbody>
         {loading && <tr><td colSpan={isSuperAdmin ? 7 : 6} className="px-4 py-16 text-center text-muted-foreground"><Loader2 className="mx-auto mb-2 h-5 w-5 animate-spin" />Loading reports...</td></tr>}
         {!loading && reports.length === 0 && <tr><td colSpan={isSuperAdmin ? 7 : 6} className="px-4 py-16 text-center"><FileBarChart2 className="mx-auto mb-3 h-9 w-9 text-muted-foreground/40" /><p className="font-medium">{view === "favorites" ? "No favorite reports yet." : search ? "No reports match your search." : "No reports found."}</p></td></tr>}
         {!loading && reports.map((report) => {
           const detailHref = `/reports/${report.id}?tenantId=${encodeURIComponent(report.tenantId)}`;
           const editParams = new URLSearchParams({ edit: report.id, tenantId: report.tenantId });
-          return <tr key={report.id} className="border-b transition hover:bg-sky-50/60"><td className="px-4 py-3"><Link href={detailHref} className="font-semibold text-[#075d91] hover:underline">{report.name}</Link></td>{isSuperAdmin && <td className="px-4 py-3 text-[#075d91]">{report.tenant?.name || "Company"}</td>}<td className="max-w-[240px] truncate px-4 py-3 text-[#075d91]">{report.description || `${report.objectName} ${report.type} report`}</td><td className="px-4 py-3">{report.folder ? <span className="flex items-center gap-2 text-primary"><FolderOpen className="h-4 w-4" />{report.folder.name}</span> : <span className="text-muted-foreground">-</span>}</td><td className="px-4 py-3 text-primary">{report.createdByName || report.createdBy}</td><td className="px-4 py-3 text-[#075d91]">{formatDate(report.createdAt)}</td><td className="relative px-4 py-3"><button type="button" aria-label={`Actions for ${report.name}`} onClick={(event) => { event.stopPropagation(); setActiveMenu(activeMenu === report.id ? null : report.id); }} className="inline-flex h-8 w-8 items-center justify-center rounded-md border border-sky-200 text-[#075d91] hover:bg-sky-50"><MoreHorizontal className="h-4 w-4" /></button>{activeMenu === report.id && <div onClick={(event) => event.stopPropagation()} className="absolute right-4 top-11 z-20 w-48 rounded-md border bg-popover py-1 shadow-lg"><MenuItem label="Run" onClick={() => window.location.assign(detailHref)} /><MenuItem label="Open" onClick={() => window.location.assign(detailHref)} /><MenuItem label="Edit" onClick={() => window.location.assign(`/reports/new?${editParams.toString()}`)} /><MenuItem label="Clone" onClick={() => void cloneReport(report)} /><MenuItem label="Share" onClick={() => { setSharingReport(report); setActiveMenu(null); }} /><MenuItem label={report.isFavorite ? "Remove from Favorites" : "Add to Favorites"} onClick={() => void toggleReportFavorite(report)} /><MenuItem label="Export CSV" onClick={() => window.open(withTenantId(`/api/proxy/api/reports/${report.id}/export?format=csv`, report.tenantId), "_blank")} /><MenuItem label="Export Excel" onClick={() => window.open(withTenantId(`/api/proxy/api/reports/${report.id}/export?format=excel`, report.tenantId), "_blank")} /><MenuItem label="Export PDF" onClick={() => window.open(withTenantId(`/api/proxy/api/reports/${report.id}/export?format=pdf`, report.tenantId), "_blank")} /><MenuItem label="Delete" danger onClick={() => void deleteReport(report)} /><MenuItem label="Move" onClick={() => { setMovingReport(report); setShowMoveModal(true); }} /></div>}</td></tr>;
+          return <tr key={report.id} className="border-b transition hover:bg-sky-50/60">
+            <td className="px-4 py-3"><Link href={detailHref} className="font-semibold text-[#075d91] hover:underline">{report.name}</Link></td>
+            {isSuperAdmin && <td className="px-4 py-3 text-[#075d91]">{report.tenant?.name || "Company"}</td>}
+            <td className="max-w-[240px] truncate px-4 py-3 text-[#075d91]">{report.description || `${report.objectName} ${report.type} report`}</td>
+            <td className="px-4 py-3">{report.folder ? <span className="flex items-center gap-2 text-primary"><FolderOpen className="h-4 w-4" />{report.folder.name}</span> : <span className="text-muted-foreground">-</span>}</td>
+            <td className="px-4 py-3 text-primary">{report.createdByName || report.createdBy}</td>
+            <td className="px-4 py-3 text-[#075d91]">{formatDate(report.createdAt)}</td>
+            <td className="px-4 py-3">
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <button type="button" aria-label={`Actions for ${report.name}`} className="inline-flex h-8 w-8 items-center justify-center rounded-md border border-sky-200 text-[#075d91] hover:bg-sky-50">
+                    <MoreHorizontal className="h-4 w-4" />
+                  </button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="end" side="bottom" collisionPadding={8} className="w-48">
+                  <MenuItem label="Run" onClick={() => window.location.assign(detailHref)} />
+                  <MenuItem label="Open" onClick={() => window.location.assign(detailHref)} />
+                  <MenuItem label="Edit" onClick={() => window.location.assign(`/reports/new?${editParams.toString()}`)} />
+                  <MenuItem label="Clone" onClick={() => void cloneReport(report)} />
+                  <MenuItem label="Share" onClick={() => setSharingReport(report)} />
+                  <MenuItem label={report.isFavorite ? "Remove from Favorites" : "Add to Favorites"} onClick={() => void toggleReportFavorite(report)} />
+                  <MenuItem label="Export CSV" onClick={() => window.open(withTenantId(`/api/proxy/api/reports/${report.id}/export?format=csv`, report.tenantId), "_blank")} />
+                  <MenuItem label="Export Excel" onClick={() => window.open(withTenantId(`/api/proxy/api/reports/${report.id}/export?format=excel`, report.tenantId), "_blank")} />
+                  <MenuItem label="Export PDF" onClick={() => window.open(withTenantId(`/api/proxy/api/reports/${report.id}/export?format=pdf`, report.tenantId), "_blank")} />
+                  <MenuItem label="Delete" danger onClick={() => void deleteReport(report)} />
+                  <MenuItem label="Move" onClick={() => { setMoveFolderSearch(""); setMoveFolders([]); setMoveError(""); setMovingReport(report); setShowMoveModal(true); }} />
+                </DropdownMenuContent>
+              </DropdownMenu>
+            </td>
+          </tr>;
         })}
       </tbody></table></div>}</main>
     </div>
@@ -443,19 +514,122 @@ function ReportsContent() {
         </div>
       </Modal>
     )}
-    {showMoveModal && movingReport && <Modal title={`Move "${movingReport.name}"`} onClose={() => { setShowMoveModal(false); setMovingReport(null); }}><div className="space-y-2"><button className="flex w-full items-center gap-3 rounded-md border p-3 text-left text-sm hover:bg-muted" onClick={() => void moveReport(null)}><Folder className="h-4 w-4" />No Folder</button>{folders.filter((folder) => folder.tenantId === movingReport.tenantId).map((folder) => <button key={folder.id} className="flex w-full items-center justify-between rounded-md border p-3 text-left text-sm hover:bg-muted" onClick={() => void moveReport(folder.id)}><span className="flex items-center gap-3"><FolderOpen className="h-4 w-4 text-primary" />{folder.name}</span><span className="text-xs text-muted-foreground">{folder._count?.reports || 0}</span></button>)}</div></Modal>}
+    {showMoveModal && movingReport && (
+      <Modal
+        title={`Move "${movingReport.name}"`}
+        onClose={() => {
+          if (movingToFolder) return;
+          setShowMoveModal(false);
+          setMovingReport(null);
+          setMoveError("");
+        }}
+      >
+        <div className="flex min-h-0 flex-col gap-3">
+          <label className="relative block">
+            <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+            <input
+              type="search"
+              value={moveFolderSearch}
+              onChange={(event) => setMoveFolderSearch(event.target.value)}
+              placeholder="Search folders..."
+              aria-label="Search folders"
+              className="h-10 w-full rounded-md border bg-background pl-9 pr-3 text-sm outline-none focus:border-primary focus:ring-2 focus:ring-primary/20"
+              autoFocus
+            />
+          </label>
+          {moveError && (
+            <p role="alert" className="rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-sm text-destructive">
+              {moveError}
+            </p>
+          )}
+          <div className="max-h-[min(55vh,28rem)] min-h-0 space-y-2 overflow-y-auto overscroll-contain pr-1">
+            <button
+              type="button"
+              disabled={movingToFolder}
+              className="flex w-full items-center gap-3 rounded-md border p-3 text-left text-sm hover:bg-muted disabled:opacity-50"
+              onClick={() => void moveReport(null)}
+            >
+              <Folder className="h-4 w-4" />
+              No Folder
+            </button>
+            {moveFoldersLoading ? (
+              <div role="status" className="flex items-center justify-center gap-2 py-8 text-sm text-muted-foreground">
+                <Loader2 className="h-4 w-4 animate-spin" />
+                Searching folders...
+              </div>
+            ) : moveFolders.length === 0 ? (
+              <p className="py-8 text-center text-sm text-muted-foreground">
+                {moveFolderSearch.trim() ? "No folders match your search." : "No available folders."}
+              </p>
+            ) : (
+              moveFolders.map((folder) => (
+                <button
+                  key={folder.id}
+                  type="button"
+                  disabled={movingToFolder}
+                  className="flex w-full items-center justify-between rounded-md border p-3 text-left text-sm hover:bg-muted disabled:opacity-50"
+                  onClick={() => void moveReport(folder.id)}
+                >
+                  <span className="flex min-w-0 items-center gap-3">
+                    <FolderOpen className="h-4 w-4 shrink-0 text-primary" />
+                    <span className="truncate">{folder.name}</span>
+                  </span>
+                  <span className="shrink-0 text-xs text-muted-foreground">
+                    {folder._count?.reports || 0} reports
+                  </span>
+                </button>
+              ))
+            )}
+          </div>
+          {movingToFolder && (
+            <p role="status" className="text-center text-xs text-muted-foreground">Moving report...</p>
+          )}
+        </div>
+      </Modal>
+    )}
     {showCreateModal && <CreateReportWizard categories={reportCategories} selectedCategory={reportTypeCategory} onCategoryChange={setReportTypeCategory} search={reportTypeSearch} onSearchChange={setReportTypeSearch} reportTypes={visibleReportTypes} loading={loadingReportTypes} tenantId={createCompanyId} onClose={() => setShowCreateModal(false)} />}
   </div>;
 }
 
 function NavHeading({ label }: { label: string }) { return <p className="mb-2 mt-5 px-4 text-xs font-semibold uppercase tracking-wide text-[#278db8] first:mt-0">{label}</p>; }
-function FolderTable({ folders, folderMenu, onMenuChange, onOpen, onRename, onDelete, onFavorite }: { folders: ReportFolder[]; folderMenu: string | null; onMenuChange: (id: string | null) => void; onOpen: (folder: ReportFolder) => void; onRename: (folder: ReportFolder) => void; onDelete: (folder: ReportFolder) => void; onFavorite: (folder: ReportFolder) => void }) {
+function FolderTable({ folders, onOpen, onRename, onDelete, onFavorite }: { folders: ReportFolder[]; onOpen: (folder: ReportFolder) => void; onRename: (folder: ReportFolder) => void; onDelete: (folder: ReportFolder) => void; onFavorite: (folder: ReportFolder) => void }) {
   const formatDate = (value: string) => formatReportDate(value);
-  return <div className="overflow-x-auto"><table className="w-full min-w-0 text-left text-sm"><thead><tr className="border-b border-sky-100 bg-sky-50 text-[#1479a8]"><th className="px-4 py-3 font-semibold">Name</th><th className="px-4 py-3 font-semibold">Company</th><th className="px-4 py-3 font-semibold">Created By</th><th className="px-4 py-3 font-semibold">Created On</th><th className="px-4 py-3 font-semibold">Last Modified By</th><th className="px-4 py-3 font-semibold">Last Modified Date</th><th className="w-16 px-4 py-3" /></tr></thead><tbody>{folders.length === 0 ? <tr><td colSpan={7} className="px-4 py-16 text-center"><Folder className="mx-auto mb-3 h-9 w-9 text-muted-foreground/40" /><p className="font-medium">No folders found.</p></td></tr> : folders.map((folder) => <tr key={folder.id} className="border-b transition hover:bg-muted/40"><td className="px-4 py-3"><button type="button" onClick={() => onOpen(folder)} className="font-medium text-primary hover:underline">{folder.name}</button><p className="mt-1 text-xs text-muted-foreground">{folder.visibility || (folder.isShared ? "PUBLIC" : "PRIVATE")} · {folder._count?.reports || 0} reports</p></td><td className="px-4 py-3 text-[#075d91]">{folder.tenant?.name || "Company"}</td><td className="px-4 py-3 text-primary">{folder.createdByName || folder.createdBy}</td><td className="px-4 py-3 text-muted-foreground">{formatDate(folder.createdAt)}</td><td className="px-4 py-3 text-primary">{folder.modifiedByName || folder.createdByName || folder.createdBy}</td><td className="px-4 py-3 text-muted-foreground">{formatDate(folder.updatedAt || folder.createdAt)}</td><td className="relative px-4 py-3"><button type="button" aria-label={`Actions for ${folder.name}`} onClick={(event) => { event.stopPropagation(); onMenuChange(folderMenu === folder.id ? null : folder.id); }} className="inline-flex h-8 w-8 items-center justify-center rounded-md border border-sky-200 text-[#075d91] hover:bg-sky-50"><MoreHorizontal className="h-4 w-4" /></button>{folderMenu === folder.id && <div onClick={(event) => event.stopPropagation()} className="absolute right-4 top-11 z-20 w-44 rounded-md border bg-popover py-1 shadow-lg"><MenuItem label="Open reports" onClick={() => onOpen(folder)} /><MenuItem label="Rename" onClick={() => onRename(folder)} /><MenuItem label={folder.isFavorite ? "Remove from Favorites" : "Add to Favorites"} onClick={() => onFavorite(folder)} /><MenuItem label="Delete" danger onClick={() => onDelete(folder)} /></div>}</td></tr>)}</tbody></table></div>;
+  return <div className="overflow-x-auto">
+    <table className="w-full min-w-0 text-left text-sm">
+      <thead><tr className="border-b border-sky-100 bg-sky-50 text-[#1479a8]"><th className="px-4 py-3 font-semibold">Name</th><th className="px-4 py-3 font-semibold">Company</th><th className="px-4 py-3 font-semibold">Created By</th><th className="px-4 py-3 font-semibold">Created On</th><th className="px-4 py-3 font-semibold">Last Modified By</th><th className="px-4 py-3 font-semibold">Last Modified Date</th><th className="w-16 px-4 py-3" /></tr></thead>
+      <tbody>
+        {folders.length === 0 ? <tr><td colSpan={7} className="px-4 py-16 text-center"><Folder className="mx-auto mb-3 h-9 w-9 text-muted-foreground/40" /><p className="font-medium">No folders found.</p></td></tr> : folders.map((folder) => (
+          <tr key={folder.id} className="border-b transition hover:bg-muted/40">
+            <td className="px-4 py-3"><button type="button" onClick={() => onOpen(folder)} className="font-medium text-primary hover:underline">{folder.name}</button><p className="mt-1 text-xs text-muted-foreground">{folder.visibility || (folder.isShared ? "PUBLIC" : "PRIVATE")} · {folder._count?.reports || 0} reports</p></td>
+            <td className="px-4 py-3 text-[#075d91]">{folder.tenant?.name || "Company"}</td>
+            <td className="px-4 py-3 text-primary">{folder.createdByName || folder.createdBy}</td>
+            <td className="px-4 py-3 text-muted-foreground">{formatDate(folder.createdAt)}</td>
+            <td className="px-4 py-3 text-primary">{folder.modifiedByName || folder.createdByName || folder.createdBy}</td>
+            <td className="px-4 py-3 text-muted-foreground">{formatDate(folder.updatedAt || folder.createdAt)}</td>
+            <td className="px-4 py-3">
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <button type="button" aria-label={`Actions for ${folder.name}`} className="inline-flex h-8 w-8 items-center justify-center rounded-md border border-sky-200 text-[#075d91] hover:bg-sky-50">
+                    <MoreHorizontal className="h-4 w-4" />
+                  </button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="end" side="bottom" collisionPadding={8} className="w-44">
+                  <MenuItem label="Open reports" onClick={() => onOpen(folder)} />
+                  <MenuItem label="Rename" onClick={() => onRename(folder)} />
+                  <MenuItem label={folder.isFavorite ? "Remove from Favorites" : "Add to Favorites"} onClick={() => onFavorite(folder)} />
+                  <MenuItem label="Delete" danger onClick={() => onDelete(folder)} />
+                </DropdownMenuContent>
+              </DropdownMenu>
+            </td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  </div>;
 }
 function MenuItem({ label, onClick, danger = false, disabled = false }: { label: string; onClick: () => void; danger?: boolean; disabled?: boolean }) {
   if (label === "Open" || label === "Export Excel" || label === "Export PDF") return null;
-  return <button type="button" disabled={disabled} className={`block w-full px-3 py-1.5 text-left text-sm ${disabled ? "cursor-not-allowed text-muted-foreground/50" : `hover:bg-muted ${danger ? "text-destructive" : ""}`}`} onClick={onClick}>{label}{disabled && <span className="ml-2 text-xs">Soon</span>}</button>;
+  return <DropdownMenuItem disabled={disabled} className={`${danger ? "text-destructive focus:text-destructive" : ""}`} onSelect={onClick}>{label}{disabled && <span className="ml-2 text-xs">Soon</span>}</DropdownMenuItem>;
 }
 function Field({ label, children }: { label: string; children: React.ReactNode }) {
   return (
@@ -469,14 +643,14 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
 function Modal({ title, children, onClose }: { title: string; children: React.ReactNode; onClose: () => void }) {
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 p-4">
-      <div className="w-full max-w-3xl rounded-md border border-slate-200 bg-white shadow-[0_16px_40px_rgba(15,23,42,0.12)]">
+      <div className="flex max-h-[calc(100vh-2rem)] w-full max-w-3xl flex-col overflow-hidden rounded-md border border-slate-200 bg-white shadow-[0_16px_40px_rgba(15,23,42,0.12)]">
         <div className="flex items-center justify-between border-b border-slate-200 px-6 py-4">
           <h2 className="text-[16px] font-semibold tracking-[-0.03em] text-slate-800">{title}</h2>
           <button type="button" aria-label="Close" onClick={onClose} className="text-slate-500 hover:text-slate-700">
             <X className="h-6 w-6" />
           </button>
         </div>
-        <div className="p-6">{children}</div>
+        <div className="min-h-0 overflow-y-auto p-6">{children}</div>
       </div>
     </div>
   );

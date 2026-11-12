@@ -2334,12 +2334,13 @@ function WidgetCard({
       )}
       <div className="flex items-center justify-between border-t px-4 py-2 text-[11px]">
         {reportId ? (
-          <Link
+          <a
             href={`/reports/${encodeURIComponent(reportId)}`}
+            target="_top"
             className="font-medium text-red-700 hover:underline"
           >
-              View Report ({widget.config?.reportName || widget.title})
-          </Link>
+            View Report ({widget.config?.reportName || widget.title})
+          </a>
         ) : (
           <button
             type="button"

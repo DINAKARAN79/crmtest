@@ -28,7 +28,7 @@ export function calendarActivityVisibilityFilter(user: {
   isSuperAdmin?: boolean;
 }): Prisma.ActivityWhereInput {
   if (user.isAdmin || user.isSuperAdmin) return {};
-  return { OR: [{ userId: user.id }, { assignedToId: user.id }] };
+  return { userId: user.id };
 }
 
 function normalizeActivityInput(body: unknown): unknown {
@@ -193,7 +193,7 @@ router.get('/', authorize('Activity', 'read'), async (req: AuthRequest, res: Res
       ];
     }
     if (isCalendarQuery) {
-      where.AND = [...(where.AND || []), calendarActivityVisibilityFilter(req.user!)];
+      where = applyScope(where, await getScopeClause(req.user!, 'activity'));
     } else {
       where = applyScope(where, await getScopeClause(req.user!, 'activity'));
     }

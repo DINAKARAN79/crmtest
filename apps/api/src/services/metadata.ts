@@ -2,6 +2,7 @@ import { prisma } from '@dct-crm/db';
 import { EffectivePermissionService } from './effectivePermissions';
 import { REPORT_OBJECTS } from '../reports/report-metadata';
 import { ensureUserObjectOnce, omitHiddenUserFields } from './userObject';
+import { ensureRoundRobinObjectsOnce } from './roundRobinObjects';
 
 const metadataCache = new Map<string, { data: any; expires: number }>();
 const CACHE_TTL = 5 * 60 * 1000;
@@ -64,6 +65,7 @@ export async function getObjectDefinitions(tenantId: string, includeInactive = f
   if (cached) return cached;
 
   await ensureUserObjectOnce(tenantId);
+  await ensureRoundRobinObjectsOnce(tenantId);
 
   const where: any = { tenantId };
   if (!includeInactive) where.isActive = true;
@@ -82,6 +84,18 @@ export async function getObjectDefinitions(tenantId: string, includeInactive = f
   const userCount = objects.some((object) => object.name === 'User')
     ? await prisma.user.count({ where: { tenantId } })
     : null;
+  const roundRobinCounts = await Promise.all([
+    objects.some((object) => object.name === 'RRQueue')
+      ? prisma.rRQueue.count({ where: { tenantId } })
+      : null,
+    objects.some((object) => object.name === 'RRQueueMember')
+      ? prisma.rRQueueMember.count({ where: { tenantId } })
+      : null,
+  ]);
+  const roundRobinCountByName = new Map([
+    ['RRQueue', roundRobinCounts[0]],
+    ['RRQueueMember', roundRobinCounts[1]],
+  ]);
   const normalized = objects.map((object) => ({
     ...object,
     _count: {
@@ -89,6 +103,9 @@ export async function getObjectDefinitions(tenantId: string, includeInactive = f
       ...(object._count.fields === 0 ? { fields: getVirtualStandardFields(object).length } : {}),
       ...(object.name === 'CallDetail' && callDetailCount !== null ? { records: callDetailCount } : {}),
       ...(object.name === 'User' && userCount !== null ? { records: userCount } : {}),
+      ...(roundRobinCountByName.get(object.name) !== null && roundRobinCountByName.has(object.name)
+        ? { records: roundRobinCountByName.get(object.name) }
+        : {}),
     },
   }));
   setCache(tenantId, cacheKey, normalized);
@@ -96,6 +113,8 @@ export async function getObjectDefinitions(tenantId: string, includeInactive = f
 }
 
 export async function getObjectDefinition(tenantId: string, objectName: string) {
+  await ensureUserObjectOnce(tenantId);
+  await ensureRoundRobinObjectsOnce(tenantId);
   const cacheKey = `object:${objectName}`;
   const cached = getCached(tenantId, cacheKey);
   if (cached) return cached;
@@ -129,6 +148,12 @@ export async function getObjectDefinition(tenantId: string, objectName: string) 
       : {}),
     ...(object.name === 'User'
       ? { _count: { ...object._count, records: await prisma.user.count({ where: { tenantId } }) } }
+      : {}),
+    ...(object.name === 'RRQueue'
+      ? { _count: { ...object._count, records: await prisma.rRQueue.count({ where: { tenantId } }) } }
+      : {}),
+    ...(object.name === 'RRQueueMember'
+      ? { _count: { ...object._count, records: await prisma.rRQueueMember.count({ where: { tenantId } }) } }
       : {}),
   };
   setCache(tenantId, cacheKey, normalized);

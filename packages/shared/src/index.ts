@@ -37,6 +37,20 @@ export const PROSPECT_REASON_TO_BUY_OPTIONS = [
 
 export const SITE_VISIT_TYPE_OPTIONS = ['Site Visit', 'Revisit', 'Booked Customer'] as const;
 
+export const CRM_SIDEBAR_ITEMS = [
+  { id: 'home', label: 'Home', href: '/home' },
+  { id: 'leads', label: 'Leads', href: '/leads' },
+  { id: 'bookings', label: 'Booking Details', href: '/bookings' },
+  { id: 'site-visits', label: 'Site Visits', href: '/site-visits' },
+  { id: 'mis-approvals', label: 'MIS Approval', href: '/mis-approvals' },
+  { id: 'projects', label: 'Projects', href: '/projects' },
+  { id: 'units', label: 'Units', href: '/units' },
+  { id: 'dashboards', label: 'Dashboards', href: '/dashboards' },
+  { id: 'reports', label: 'Reports', href: '/reports' },
+  { id: 'follow-ups', label: 'Follow-ups', href: '/follow-ups' },
+  { id: 'setup', label: 'Setup', href: '/setup' },
+] as const;
+
 export const UNIT_PROPERTY_TYPES = ['Apartment', 'Plot', 'Villa'] as const;
 export type UnitPropertyType = (typeof UNIT_PROPERTY_TYPES)[number];
 
@@ -493,6 +507,10 @@ export const leadSchema = z.object({
     required_error: 'Phone number is required.',
     invalid_type_error: 'Phone number is required.',
   }).trim().min(1, 'Phone number is required.').transform(normalizePhone),
+  secondaryPhone: z.string().trim().max(64).nullable().optional(),
+  tertiaryPhone: z.string().trim().max(64).nullable().optional(),
+  secondaryCountryCode: z.string().trim().regex(/^\+?\d{1,3}$/).nullable().optional(),
+  tertiaryCountryCode: z.string().trim().regex(/^\+?\d{1,3}$/).nullable().optional(),
   mobile: z.string().optional(),
   website: z.string().url().optional().or(z.literal('')),
   company: z.string({

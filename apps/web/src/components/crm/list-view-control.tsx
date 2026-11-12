@@ -7,6 +7,7 @@ import { listViewApi } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
+import { useAuth } from "@/contexts/auth-context";
 import { useToast } from "@/hooks/use-toast";
 
 export type ListModule = "LEAD" | "FOLLOW_UP" | "SITE_VISIT" | "BOOKING" | "PROJECT" | "UNIT" | "MIS_APPROVAL";
@@ -76,6 +77,8 @@ export function useRecordView(module: ListModule, recordId?: string) {
 
 export function useListView(module: ListModule) {
   const { toast } = useToast();
+  const { isAdmin, isSuperAdmin } = useAuth();
+  const canCreateListView = isAdmin || isSuperAdmin;
   const [catalog, setCatalog] = React.useState<Catalog | null>(null);
   const [ready, setReady] = React.useState(false);
   const [selectedKey, setSelectedKey] = React.useState("");
@@ -298,11 +301,13 @@ export function useListView(module: ListModule) {
           <ViewSection title="Recent List Views" views={visibleViews(catalog, "recent", search)} pinnedKeys={catalog?.pinnedKeys || []} menuKey={menuKey} onMenu={setMenuKey} onSelect={selectView} onPin={togglePin} onEdit={openEdit} onDuplicate={duplicateView} onDelete={deleteView} />
           <ViewSection title="All Other Lists" views={visibleViews(catalog, "other", search)} pinnedKeys={catalog?.pinnedKeys || []} menuKey={menuKey} onMenu={setMenuKey} onSelect={selectView} onPin={togglePin} onEdit={openEdit} onDuplicate={duplicateView} onDelete={deleteView} />
         </div>
-        <div className="border-t border-sky-100 p-2">
-          <button type="button" className="flex h-8 w-full items-center justify-center gap-1 rounded-md bg-[#1479a8] text-xs font-semibold text-white hover:bg-[#075d91]" onClick={openCreate}>
-            <Plus className="h-3.5 w-3.5" /> Create List View
-          </button>
-        </div>
+        {canCreateListView && (
+          <div className="border-t border-sky-100 p-2">
+            <button type="button" className="flex h-8 w-full items-center justify-center gap-1 rounded-md bg-[#1479a8] text-xs font-semibold text-white hover:bg-[#075d91]" onClick={openCreate}>
+              <Plus className="h-3.5 w-3.5" /> Create List View
+            </button>
+          </div>
+        )}
       </PopoverContent>
     </Popover>
     <button type="button" className="inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-md border border-[#bae6fd] bg-white text-[#075d91] hover:bg-[#f5fbff] dark:border-sky-800 dark:bg-slate-950 dark:text-sky-100 dark:hover:bg-slate-900" aria-label="Refresh list" onClick={() => setReloadToken((value) => value + 1)}>

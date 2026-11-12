@@ -9,18 +9,17 @@ import {
   duplicateLeadFields,
   findLeadDuplicatesBatch,
   findLeadDuplicates,
+  oldestLeadDuplicate,
   type LeadDuplicateInput,
   type LeadDuplicateMatch,
   normalizeLeadEmail,
   normalizeLeadPhone,
+  oldestPhoneDuplicate,
   validateLeadContactInput,
 } from './leadDuplicateDetection';
 import {
   assignLeadToProjectRoundRobinInTransaction,
   assignSiteVisitToSVCInTransaction,
-  findApplicableRRQueue,
-  isLeadEligibleForAutoAssignment,
-  RoundRobinAssignmentService,
   type RRMemberUserType,
 } from './rrQueue';
 import { createEnquiryInTransaction, createEnquiryInTransactionWithStatus } from './enquiryService';
@@ -31,7 +30,9 @@ import {
   mergeOperationalLeadCustomFields,
   tagLeadEnquiryAttribution,
   tagLeadSiteVisitEvents,
+  updateSalesforceCustomFields,
 } from './leadEventTagging';
+import { applyReopenedLeadSideEffects, getReopenedRoundRobinUserType } from './leadReopenLifecycle';
 
 export type EnquiryAction =
   | 'NEW_LEAD'
@@ -196,6 +197,8 @@ export async function processLeadEnquiry(
     duplicateMatches?: LeadDuplicateMatch[];
     duplicateLocksAcquired?: boolean;
     rejectDuplicates?: boolean;
+    phoneOnlyDuplicates?: boolean;
+    preferOldestDuplicate?: boolean;
   } = {},
 ) {
   const validationErrors = validateLeadContactInput({
@@ -290,7 +293,10 @@ export async function processLeadEnquiry(
     const ownerId = selectedOwner?.id || input.userId;
     const ownerProfileName = selectedOwner?.profile?.name || input.profileName || null;
 
-    const duplicateInput = leadDuplicateInputForEnquiry(input);
+    const enquiryDuplicateInput = leadDuplicateInputForEnquiry(input);
+    const duplicateInput = options.phoneOnlyDuplicates
+      ? { ...enquiryDuplicateInput, emails: [] }
+      : enquiryDuplicateInput;
     if (!options.duplicateLocksAcquired) {
       await acquireLeadDuplicateLocks(tx, input.tenantId, duplicateInput);
     }
@@ -348,8 +354,13 @@ export async function processLeadEnquiry(
       return siteVisit;
     };
 
-    const duplicateMatches = options.duplicateMatches
+    let duplicateMatches = options.duplicateMatches
       || await findLeadDuplicates(tx, input.tenantId, duplicateInput);
+    if (options.preferOldestDuplicate && duplicateMatches.length > 1) {
+      duplicateMatches = oldestLeadDuplicate(duplicateMatches);
+    } else if (duplicateMatches.length > 1) {
+      duplicateMatches = oldestPhoneDuplicate(duplicateMatches);
+    }
     const matchingIds = duplicateMatches.map((match) => match.lead.id);
     const existingLeads = matchingIds.length
       ? await tx.lead.findMany({
@@ -472,6 +483,7 @@ export async function processLeadEnquiry(
         }),
         enquiryDate: metadata.enquiryDate,
         userId: input.userId,
+        skipSourceDeduplication: isReOpened,
       });
       const { enquiry, created: enquiryCreated } = enquiryResult;
       const lifecycleType = enquiryCreated
@@ -573,13 +585,15 @@ export async function processLeadEnquiry(
         leadUpdates.enquiryCount = { increment: 1 };
         if (!existing.firstCampaign && metadata.campaign) leadUpdates.firstCampaign = metadata.campaign;
       }
-      if (enquiryCreated && (processReOpened || action === 'RE_ENGAGED')) {
+      if (enquiryCreated && processReOpened) {
         Object.assign(leadUpdates, {
-            status: 'NEW',
-            leadType: processReOpened ? 'RE_OPENED' : 'RE_ENGAGED',
-            ...(processReEngaged ? { lastReEngagedAt: now } : {}),
-            lostAt: null,
-            ownerId,
+          status: 'NEW',
+          leadType: 'RE_OPENED',
+          lostAt: null,
+          ownerId: existing.ownerId,
+          ...(input.lead.projectId ? { projectId: input.lead.projectId } : {}),
+          ...(metadata.campaign ? { campaign: metadata.campaign } : {}),
+          ...(metadata.subSource ? { leadSubSource: metadata.subSource } : {}),
         });
       } else if (enquiryCreated && processReEngaged) {
         leadUpdates.leadType = 'RE_ENGAGED';
@@ -618,10 +632,18 @@ export async function processLeadEnquiry(
           secondaryCountryCode: metadata.secondaryCountryCode,
           tertiaryPhone: metadata.tertiaryPhone,
           secondaryEmail: metadata.secondaryEmail,
+          channelPartner: metadata.channelPartner,
           occurredAt: now,
           lifecycleType: lifecycleType === 'RE_OPENED' ? 'Re-Opened' : 'Re-Engaged',
           isReEngaged: processReEngaged,
           isReOpened: processReOpened,
+        });
+      }
+      if (processReOpened) {
+        await applyReopenedLeadSideEffects(tx, {
+          tenantId: input.tenantId,
+          leadId: existing.id,
+          previousCustomFields: existing.customFields,
         });
       }
       if (enquiryCreated) {
@@ -656,36 +678,46 @@ export async function processLeadEnquiry(
       }
 
       let assignment: unknown = null;
-      if (enquiryCreated && (processReOpened || action === 'RE_ENGAGED')) {
+      let assignmentWarning: string | undefined;
+      if (enquiryCreated && processReOpened) {
         const projectId = input.lead.projectId || existing.projectId;
-        const projectName = input.lead.projectId
-          ? (await tx.project.findFirst({ where: { id: input.lead.projectId, tenantId: input.tenantId }, select: { name: true } }))?.name || null
-          : existing.project?.name || null;
-        const rrQueue = input.salesUserId ? null : await findApplicableRRQueue(input.tenantId, {
-          projectId,
-          projectName,
-          status: 'NEW',
-          source: metadata.source,
-        }, tx);
-        if (rrQueue && isLeadEligibleForAutoAssignment({
-          status: 'NEW',
-          source: metadata.source,
-          lastSourceOfEnquiry: metadata.source,
-          projectId,
-          projectName,
-          leadQueueing: true,
-          leadAssigned: false,
-        }, { isNewLead: true })) {
-          assignment = await RoundRobinAssignmentService.assignLeadInTransaction(
-            tx,
-            rrQueue.id,
-            existing.id,
-            input.tenantId,
-            input.userId,
-          );
+        const userType = getReopenedRoundRobinUserType(input.profileName);
+        try {
+          assignment = await assignLeadToProjectRoundRobinInTransaction(tx, {
+            tenantId: input.tenantId,
+            leadId: existing.id,
+            projectId,
+            userType,
+            actorId: input.userId,
+            reason: `Lost lead reopened and assigned to ${userType} round robin`,
+          });
+        } catch (error) {
+          if (!(error instanceof Error)) throw error;
+          if (error.message === 'RR_PROJECT_REQUIRED') {
+            assignmentWarning = 'No project is configured for this reopened lead; round-robin assignment is pending.';
+          } else if (error.message === `RR_QUEUE_NOT_CONFIGURED:${userType}`) {
+            assignmentWarning = `No ${userType} round-robin queue is configured; assignment is pending.`;
+          } else if (error.message === `NO_ELIGIBLE_RR_MEMBER:${userType}`) {
+            assignmentWarning = `No eligible ${userType} round-robin member is available; assignment is pending.`;
+          } else {
+            throw error;
+          }
         }
-        const assignedLead = await tx.lead.findUnique({ where: { id: existing.id }, select: { ownerId: true } });
-        if (assignedLead?.ownerId !== existing.ownerId) {
+        const assignedLead = await tx.lead.findUnique({
+          where: { id: existing.id },
+          select: { ownerId: true, customFields: true },
+        });
+        if (assignment && assignedLead) {
+          await tx.lead.update({
+            where: { id: existing.id },
+            data: {
+              customFields: updateSalesforceCustomFields(assignedLead.customFields, {
+                Lead_Assigned__c: true,
+              }),
+            },
+          });
+        }
+        if (assignedLead?.ownerId !== existing.ownerId && !assignment) {
           const newOwner = assignedLead?.ownerId
             ? await tx.user.findUnique({ where: { id: assignedLead.ownerId }, select: { profile: { select: { name: true } } } })
             : null;
@@ -734,7 +766,17 @@ export async function processLeadEnquiry(
           project: { select: { id: true, name: true } },
         },
       });
-      return { action, lead, leadId: existing.id, enquiry, validationDays, daysDifference, assignment, siteVisit };
+      return {
+        action,
+        lead,
+        leadId: existing.id,
+        enquiry,
+        validationDays,
+        daysDifference,
+        assignment,
+        assignmentWarning,
+        siteVisit,
+      };
     }
 
     const leadNumber = await getNextLeadNumber(tx, input.tenantId);
@@ -815,6 +857,7 @@ export async function processLeadEnquiry(
       secondaryCountryCode: metadata.secondaryCountryCode,
       tertiaryPhone: metadata.tertiaryPhone,
       secondaryEmail: metadata.secondaryEmail,
+      channelPartner: metadata.channelPartner,
       occurredAt: now,
       lifecycleType: 'Fresh',
       isLeadCreation: true,

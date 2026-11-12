@@ -4,7 +4,7 @@ import { z } from 'zod';
 import { prisma } from '@dct-crm/db';
 import { authenticate, AuthRequest } from '../middleware/auth';
 import { authorize } from '../middleware/authorization';
-import { canAccessLeadId } from '../services/recordAccess';
+import { canAccessLeadId, getReportRecordAccessClause } from '../services/recordAccess';
 import { applyCallLogStatusRule } from '../services/callLogStatus';
 import { followUpAccessWhere } from '../services/followUpAccess';
 import { tagLeadFollowUpEvents } from '../services/leadEventTagging';
@@ -13,6 +13,14 @@ import { maskPhone } from '../services/telephonyNumber';
 
 const router = Router();
 router.use(authenticate);
+
+async function callDetailAccessWhere(req: AuthRequest) {
+  const recordScope = await getReportRecordAccessClause(req.user!, 'CallDetail');
+  return {
+    tenantId: req.tenantId!,
+    ...(recordScope ? { AND: [recordScope] } : {}),
+  };
+}
 
 export const callDetailSchema = z.object({
   leadId: z.string().min(1),
@@ -50,13 +58,10 @@ router.get('/', authorize('Activity', 'read'), async (req: AuthRequest, res: Res
     }
 
     const data = await prisma.callDetail.findMany({
-      where: leadId
-        ? { tenantId: req.tenantId!, leadId }
-        : {
-          tenantId: req.tenantId!,
-          leadId: null,
-          ...(!req.user?.isAdmin && !req.user?.isSuperAdmin ? { createdById: req.user!.id } : {}),
-        },
+      where: {
+        ...await callDetailAccessWhere(req),
+        leadId: leadId || null,
+      },
       include: {
         createdBy: { select: { id: true, firstName: true, lastName: true } },
         lastModifiedBy: { select: { id: true, firstName: true, lastName: true } },
@@ -87,7 +92,7 @@ router.get('/', authorize('Activity', 'read'), async (req: AuthRequest, res: Res
 router.get('/:id', authorize('Activity', 'read'), async (req: AuthRequest, res: Response) => {
   try {
     const call = await prisma.callDetail.findFirst({
-      where: { id: req.params.id, tenantId: req.tenantId! },
+      where: { id: req.params.id, ...await callDetailAccessWhere(req) },
       include: {
         createdBy: { select: { id: true, firstName: true, lastName: true } },
         lastModifiedBy: { select: { id: true, firstName: true, lastName: true } },
@@ -97,9 +102,7 @@ router.get('/:id', authorize('Activity', 'read'), async (req: AuthRequest, res: 
       },
     });
     if (!call) return res.status(404).json({ success: false, error: 'Call details not found' });
-    const canReadUnlinkedCall = call.leadId === null
-      && (call.createdById === req.user!.id || req.user?.isAdmin || req.user?.isSuperAdmin);
-    if (call.leadId ? !(await canAccessLeadId(req.user!, call.leadId)) : !canReadUnlinkedCall) {
+    if (call.leadId && !(await canAccessLeadId(req.user!, call.leadId))) {
       return res.status(403).json({ success: false, error: 'You do not have access to this call' });
     }
     const maskNumbers = call.leadId === null || (!req.user?.isAdmin && !req.user?.isSuperAdmin &&
@@ -268,12 +271,10 @@ router.post('/', authorize('Activity', 'create'), async (req: AuthRequest, res: 
 router.put('/:id', authorize('Activity', 'edit'), async (req: AuthRequest, res: Response) => {
   try {
     const existing = await prisma.callDetail.findFirst({
-      where: { id: req.params.id, tenantId: req.tenantId! },
+      where: { id: req.params.id, ...await callDetailAccessWhere(req) },
     });
     if (!existing) return res.status(404).json({ success: false, error: 'Call details not found' });
-    const canEditUnlinkedCall = existing.leadId === null
-      && (existing.createdById === req.user!.id || req.user?.isAdmin || req.user?.isSuperAdmin);
-    if (existing.leadId ? !(await canAccessLeadId(req.user!, existing.leadId)) : !canEditUnlinkedCall) {
+    if (existing.leadId && !(await canAccessLeadId(req.user!, existing.leadId))) {
       return res.status(403).json({ success: false, error: 'You do not have access to this call' });
     }
 
@@ -376,12 +377,10 @@ router.put('/:id', authorize('Activity', 'edit'), async (req: AuthRequest, res: 
 router.delete('/:id', authorize('Activity', 'delete'), async (req: AuthRequest, res: Response) => {
   try {
     const existing = await prisma.callDetail.findFirst({
-      where: { id: req.params.id, tenantId: req.tenantId! },
+      where: { id: req.params.id, ...await callDetailAccessWhere(req) },
     });
     if (!existing) return res.status(404).json({ success: false, error: 'Call details not found' });
-    const canDeleteUnlinkedCall = existing.leadId === null
-      && (existing.createdById === req.user!.id || req.user?.isAdmin || req.user?.isSuperAdmin);
-    if (existing.leadId ? !(await canAccessLeadId(req.user!, existing.leadId)) : !canDeleteUnlinkedCall) {
+    if (existing.leadId && !(await canAccessLeadId(req.user!, existing.leadId))) {
       return res.status(403).json({ success: false, error: 'You do not have access to this call' });
     }
     await prisma.$transaction(async (tx) => {

@@ -50,6 +50,7 @@ vi.mock('../middleware/authorization', () => ({
 
 vi.mock('../services/recordAccess', () => ({
   canAccessLeadId: vi.fn().mockResolvedValue(true),
+  getReportRecordAccessClause: vi.fn().mockResolvedValue(null),
 }));
 vi.mock('../services/leadEventTagging', () => ({
   tagLeadFollowUpEvents: vi.fn().mockResolvedValue(undefined),

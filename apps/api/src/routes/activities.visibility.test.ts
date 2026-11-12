@@ -2,10 +2,8 @@ import { describe, expect, it } from 'vitest';
 import { calendarActivityVisibilityFilter } from './activities';
 
 describe('calendar activity visibility', () => {
-  it('limits regular users to activities they created or are assigned', () => {
-    expect(calendarActivityVisibilityFilter({ id: 'user-a' })).toEqual({
-      OR: [{ userId: 'user-a' }, { assignedToId: 'user-a' }],
-    });
+  it('limits regular users to activities they own', () => {
+    expect(calendarActivityVisibilityFilter({ id: 'user-a' })).toEqual({ userId: 'user-a' });
   });
 
   it('allows admins to view all tenant activities', () => {

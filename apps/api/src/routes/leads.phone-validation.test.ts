@@ -87,6 +87,25 @@ describe('leadUpdateSchema', () => {
     const result = leadUpdateSchema.safeParse({ status: 'NOT_A_STATUS', tenantId: 'tenant-1' });
     expect(result.success).toBe(false);
   });
+
+  it('accepts edits to secondary and tertiary phone numbers and country codes', () => {
+    const result = leadUpdateSchema.safeParse({
+      secondaryPhone: '+44 2071234567',
+      secondaryCountryCode: '+44',
+      tertiaryPhone: '9876543210',
+      tertiaryCountryCode: '91',
+    });
+
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data).toMatchObject({
+        secondaryPhone: '+44 2071234567',
+        secondaryCountryCode: '+44',
+        tertiaryPhone: '9876543210',
+        tertiaryCountryCode: '91',
+      });
+    }
+  });
 });
 
 describe('PHONE_DUPLICATE_ERROR', () => {

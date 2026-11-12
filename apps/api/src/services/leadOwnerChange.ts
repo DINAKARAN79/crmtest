@@ -1,8 +1,9 @@
 import { prisma } from '@dct-crm/db';
 import { EffectivePermissionService } from './effectivePermissions';
-import { canAccessLead } from './recordAccess';
+import { canEditLead } from './recordAccess';
 import { createOwnerHistory } from './ownerHistory';
 import { appendLeadProcessNote } from './leadNotes';
+import { moveScheduledChildrenToLeadOwner } from './leadReopenLifecycle';
 
 export async function changeLeadOwner(params: {
   leadId: string;
@@ -26,8 +27,8 @@ export async function changeLeadOwner(params: {
     },
   });
   if (!lead) throw new Error('Lead not found');
-  if (!(await canAccessLead(params.changedBy, lead))) {
-    throw new Error('You do not have access to this lead');
+  if (!(await canEditLead(params.changedBy, lead))) {
+    throw new Error('This lead is read-only for your user.');
   }
   if (lead.ownerId === params.newOwnerId) {
     throw new Error('New owner must be different from the current owner');
@@ -68,6 +69,13 @@ export async function changeLeadOwner(params: {
         owner: { select: { id: true, firstName: true, lastName: true, email: true } },
         project: { select: { id: true, name: true } },
       },
+    });
+    await moveScheduledChildrenToLeadOwner(tx, {
+      tenantId: lead.tenantId,
+      leadId: lead.id,
+      newOwnerId: newOwner.id,
+      leadStatus: lead.status,
+      customFields: lead.customFields,
     });
 
     await createOwnerHistory({

@@ -36,6 +36,22 @@ export interface LeadDuplicateMatch {
   evidence: Array<{ contactKey: string; field: string; ambiguous: boolean }>;
 }
 
+export function oldestLeadDuplicate<T extends { lead: { id: string; createdAt: Date } }>(matches: T[]): T[] {
+  return [...matches]
+    .sort((left, right) => (
+      left.lead.createdAt.getTime() - right.lead.createdAt.getTime()
+      || left.lead.id.localeCompare(right.lead.id)
+    ))
+    .slice(0, 1);
+}
+
+export function oldestPhoneDuplicate(matches: LeadDuplicateMatch[]): LeadDuplicateMatch[] {
+  const exactPhoneMatches = matches.filter((match) =>
+    match.evidence.some((item) => item.contactKey.startsWith('PHONE:') && !item.ambiguous),
+  );
+  return exactPhoneMatches.length ? oldestLeadDuplicate(exactPhoneMatches) : matches;
+}
+
 export type LeadDuplicateField = 'phone' | 'email';
 
 export function duplicateLeadFields(matches: LeadDuplicateMatch[]): LeadDuplicateField[] {

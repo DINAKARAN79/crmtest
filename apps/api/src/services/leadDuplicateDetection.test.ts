@@ -7,10 +7,60 @@ import {
   findLeadDuplicates,
   findLeadDuplicatesBatch,
   leadDuplicateContactKeys,
+  oldestLeadDuplicate,
+  oldestPhoneDuplicate,
   normalizeLeadEmail,
   normalizeLeadPhone,
   validateLeadContactInput,
 } from './leadDuplicateDetection';
+
+describe('oldestPhoneDuplicate', () => {
+  const match = (
+    id: string,
+    createdAt: string,
+    evidence: Array<{ contactKey: string; field: string; ambiguous: boolean }>,
+  ) => ({
+    lead: {
+      id,
+      leadNumber: id,
+      firstName: null,
+      lastName: id,
+      company: id,
+      status: 'NEW',
+      ownerId: null,
+      projectId: null,
+      createdAt: new Date(createdAt),
+    },
+    matchedFields: [],
+    ambiguous: evidence.some((item) => item.ambiguous),
+    evidence,
+  });
+
+  it('chooses the oldest exact phone match over email-only matches', () => {
+    const oldestPhone = match('phone-oldest', '2026-01-01T00:00:00Z', [
+      { contactKey: 'PHONE:+919876543210', field: 'phone:phone', ambiguous: false },
+    ]);
+    const newerPhone = match('phone-newer', '2026-02-01T00:00:00Z', [
+      { contactKey: 'PHONE:+919876543210', field: 'phone:secondaryPhone', ambiguous: false },
+    ]);
+    const emailOnly = match('email-only', '2025-01-01T00:00:00Z', [
+      { contactKey: 'EMAIL:user@example.invalid', field: 'email:email', ambiguous: false },
+    ]);
+
+    expect(oldestPhoneDuplicate([newerPhone, emailOnly, oldestPhone])).toEqual([oldestPhone]);
+  });
+
+  it('preserves ambiguous phone matches for review when there is no exact phone match', () => {
+    const ambiguous = match('ambiguous', '2026-01-01T00:00:00Z', [
+      { contactKey: 'PHONE:+919876543210', field: 'phone:possible.phone', ambiguous: true },
+    ]);
+    const emailOnly = match('email', '2025-01-01T00:00:00Z', [
+      { contactKey: 'EMAIL:user@example.invalid', field: 'email:email', ambiguous: false },
+    ]);
+
+    expect(oldestPhoneDuplicate([ambiguous, emailOnly])).toEqual([ambiguous, emailOnly]);
+  });
+});
 
 function mockDatabase(leads: Array<Record<string, unknown>>) {
   return {
@@ -59,6 +109,16 @@ describe('lead contact normalization', () => {
 });
 
 describe('duplicate contact responses', () => {
+  it('selects the oldest matching Lead and deterministically breaks timestamp ties', () => {
+    const matches = [
+      { lead: { id: 'later', createdAt: new Date('2026-03-01T00:00:00Z') } },
+      { lead: { id: 'same-time-b', createdAt: new Date('2026-01-01T00:00:00Z') } },
+      { lead: { id: 'same-time-a', createdAt: new Date('2026-01-01T00:00:00Z') } },
+    ];
+
+    expect(oldestLeadDuplicate(matches)).toEqual([matches[2]]);
+  });
+
   it('reports both duplicate contact fields without exposing a lead record', () => {
     const matches = [{
       lead: {

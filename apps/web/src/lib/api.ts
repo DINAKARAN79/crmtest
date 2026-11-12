@@ -448,8 +448,6 @@ export const impersonationApi = {
 export const leadApi = {
   list: (params?: Record<string, any>) =>
     api.get<ApiResponse>('/api/leads', { params }),
-  bookedBucketAccess: () =>
-    api.get<ApiResponse>('/api/leads/booked-bucket-access'),
   statuses: () =>
     api.get<ApiResponse>('/api/leads/statuses'),
   salesUsers: () =>
@@ -867,21 +865,6 @@ export const telephonySettingsApi = {
     api.get<ApiResponse>('/api/setup/telephony/logs', { params: tenantId ? { tenantId } : undefined }),
 };
 
-export const bookedBucketSettingsApi = {
-  get: (tenantId?: string) =>
-    api.get<ApiResponse>('/api/setup/booked-bucket', { params: tenantId ? { tenantId } : undefined }),
-  update: (data: {
-    isActive: boolean;
-    fallbackUserId: string | null;
-    memberIds: string[];
-    moveOpenFollowUps: boolean;
-    returnToPreviousOwnerOnCancel: boolean;
-  }, tenantId?: string) =>
-    api.put<ApiResponse>('/api/setup/booked-bucket', data, { params: tenantId ? { tenantId } : undefined }),
-  preview: (tenantId?: string) =>
-    api.get<ApiResponse>('/api/setup/booked-bucket/preview', { params: tenantId ? { tenantId } : undefined }),
-};
-
 export const telephonyDialpadApi = {
   clientConfig: () =>
     api.get<ApiResponse>('/api/telephony/client-config'),
@@ -1150,6 +1133,17 @@ export const newPermissionSetApi = {
     api.post<ApiResponse>(`/api/new-permission-sets/${id}/assign`, { userIds }),
   unassign: (id: string, userId: string) =>
     api.delete<ApiResponse>(`/api/new-permission-sets/${id}/assign/${userId}`),
+  getObjectPermissions: (id: string, objectName: string) =>
+    api.get<ApiResponse>(`/api/permission-sets/${id}/object-permissions/${objectName}`),
+  updateObjectPermissions: (id: string, objectName: string, data: {
+    canCreate?: boolean;
+    canRead?: boolean;
+    canUpdate?: boolean;
+    canDelete?: boolean;
+    canViewAll?: boolean;
+    canEditAll?: boolean;
+  }) =>
+    api.put<ApiResponse>(`/api/permission-sets/${id}/object-permissions/${objectName}`, data),
 };
 
 // User Permissions API (direct permissions + permission set assignments)

@@ -1,6 +1,35 @@
 import type { Prisma, PrismaClient } from '@prisma/client';
+import { Prisma as PrismaNamespace } from '@prisma/client';
 
 type Db = Prisma.TransactionClient | PrismaClient;
+
+export const DUPLICATE_SCHEDULED_FOLLOW_UP_ERROR = 'A follow-up is already scheduled for this Lead.';
+
+export class DuplicateScheduledFollowUpError extends Error {
+  constructor() {
+    super(DUPLICATE_SCHEDULED_FOLLOW_UP_ERROR);
+    this.name = 'DuplicateScheduledFollowUpError';
+  }
+}
+
+export async function ensureNoDuplicateScheduledFollowUp(
+  db: Db,
+  params: { tenantId: string; leadId: string; excludeId?: string },
+): Promise<void> {
+  await db.$executeRaw(
+    PrismaNamespace.sql`SELECT pg_advisory_xact_lock(hashtextextended(${`FOLLOW_UP_SCHEDULED:${params.tenantId}:${params.leadId}`}, 0))`,
+  );
+  const existing = await db.followUp.findFirst({
+    where: {
+      tenantId: params.tenantId,
+      leadId: params.leadId,
+      status: 'SCHEDULED',
+      ...(params.excludeId ? { id: { not: params.excludeId } } : {}),
+    },
+    select: { id: true },
+  });
+  if (existing) throw new DuplicateScheduledFollowUpError();
+}
 
 export function futureFollowUpError(dueDate: string, now = Date.now()): string | null {
   const due = new Date(dueDate);

@@ -3,8 +3,6 @@ import { prisma } from '@dct-crm/db';
 import {
   leadCreateSchema,
   leadUpdateSchema,
-  normalizePhone,
-  PHONE_DUPLICATE_ERROR,
   PROSPECT_BEDROOM_OPTIONS,
   PROSPECT_BUDGET_OPTIONS,
   PROSPECT_POSSESSION_OPTIONS,
@@ -26,6 +24,7 @@ import { EffectivePermissionService } from '../services/effectivePermissions';
 import { canScheduleSiteVisit, canTransitionStatus, canonicalProfileName, isValidStatus } from '../services/workflow';
 import { createOwnerHistory, getOwnerHistory } from '../services/ownerHistory';
 import {
+  canEditLead,
   canAccessLead,
   getLeadRecordScope,
   leadScopeClause,
@@ -46,15 +45,16 @@ import {
 import { changeLeadOwner, getEligibleLeadOwners } from '../services/leadOwnerChange';
 import { processLeadEnquiry, sourceEnumValue } from '../services/enquiryProcessing';
 import { getLeadEnquiries } from '../services/enquiryService';
-import { mergeOperationalLeadCustomFields } from '../services/leadEventTagging';
+import { mergeOperationalLeadCustomFields, updateSalesforceCustomFields } from '../services/leadEventTagging';
 import { appendLeadProcessNote } from '../services/leadNotes';
 import { getTenantTimezone } from '../services/tenantTimezone';
 import { ensureProspectLeadFields, type ProspectLeadDetails } from '../services/prospectLeadFields';
 import { ensureSiteVisitScheduleFields } from '../services/siteVisitScheduleFields';
 import {
-  duplicateLeadFields,
+  acquireLeadDuplicateLocks,
   duplicateLeadMessage,
   findLeadDuplicates,
+  normalizeLeadPhone,
   validateLeadContactInput,
 } from '../services/leadDuplicateDetection';
 import { getLeadPicklistOptions, validateLeadPicklists } from '../services/leadPicklists';
@@ -227,25 +227,6 @@ async function enrichAuditLogs<T extends { oldValues?: unknown; newValues?: unkn
     oldValues: auditDisplayValues(log.oldValues as Record<string, unknown> | null | undefined, nameById),
     newValues: auditDisplayValues(log.newValues as Record<string, unknown> | null | undefined, nameById),
   }));
-}
-
-async function findPhoneConflict(
-  tenantId: string,
-  phone: string,
-  excludeLeadId?: string,
-): Promise<boolean> {
-  const normalized = normalizePhone(phone);
-  const candidates = await prisma.lead.findMany({
-    where: {
-      tenantId,
-      phone: { not: null },
-      ...(excludeLeadId ? { id: { not: excludeLeadId } } : {}),
-    },
-    select: { id: true, phone: true },
-  });
-  return candidates.some(
-    (lead) => lead.phone != null && normalizePhone(lead.phone) === normalized,
-  );
 }
 
 function isPhoneUniqueViolation(error: any): boolean {
@@ -600,8 +581,8 @@ router.post('/:id/enquiries', authorize('Enquiry', 'create'), async (req: AuthRe
       where: { id: req.params.id, ...leadIdScope(req) },
     });
     if (!existing) return res.status(404).json({ success: false, error: 'Lead not found' });
-    if (!(await canAccessLead(req.user!, existing))) {
-      return res.status(403).json({ success: false, error: 'You do not have access to this lead' });
+    if (!(await canEditLead(req.user!, existing))) {
+      return res.status(403).json({ success: false, error: 'This lead is read-only for your user.' });
     }
     if (
       payload.siteVisit &&
@@ -813,6 +794,7 @@ router.get('/:id', authorize('Lead', 'read'), async (req: AuthRequest, res: Resp
         };
 
     const leadWithStatus = await decorateLeadStatus(lead.tenantId, lead);
+    const editable = await canEditLead(req.user!, lead);
     res.json({
       success: true,
       data: {
@@ -826,6 +808,7 @@ router.get('/:id', authorize('Lead', 'read'), async (req: AuthRequest, res: Resp
         auditLogs: await enrichAuditLogs(lead.auditLogs),
         ownerHistory,
         lastModified,
+        readOnly: !editable,
       },
     });
   } catch (error) {
@@ -1101,7 +1084,11 @@ router.post('/', authorize('Lead', 'create'), async (req: AuthRequest, res: Resp
             notes: metadata.siteVisit.notes,
           }
         : undefined,
-    }, { rejectDuplicates: !metadata.linkToLeadId });
+    }, {
+      rejectDuplicates: false,
+      phoneOnlyDuplicates: true,
+      preferOldestDuplicate: true,
+    });
     if (result.action === 'DUPLICATE_CONFLICT') {
       const leadIds = await getAccessibleDuplicateLeadIds(req, result.leadIds);
       return res.status(409).json({
@@ -1234,8 +1221,8 @@ router.put('/:id', authorize('Lead', 'edit'), async (req: AuthRequest, res: Resp
       return res.status(404).json({ success: false, error: 'Lead not found' });
     }
 
-    if (!(await canAccessLead(req.user!, existingLead))) {
-      return res.status(403).json({ success: false, error: 'You do not have access to this lead' });
+    if (!(await canEditLead(req.user!, existingLead))) {
+      return res.status(403).json({ success: false, error: 'This lead is read-only for your user.' });
     }
 
     const requestedOwnerId = req.body && typeof req.body === 'object'
@@ -1343,12 +1330,61 @@ router.put('/:id', authorize('Lead', 'edit'), async (req: AuthRequest, res: Resp
       return res.status(400).json({ success: false, error: `Lead status ${data.status} is disabled for this company` });
     }
 
-    if (data.phone !== undefined && data.phone !== '') {
-      const phoneToCheck = normalizePhone(data.phone);
-      if (await findPhoneConflict(existingLead.tenantId, phoneToCheck, req.params.id)) {
-        return res.status(409).json({ success: false, error: PHONE_DUPLICATE_ERROR });
+    const changedPhones = [
+      {
+        field: 'phone' as const,
+        value: data.phone,
+        previous: existingLead.phone,
+        countryCode: existingLead.countryCode || '91',
+      },
+      {
+        field: 'secondaryPhone' as const,
+        value: data.secondaryPhone,
+        previous: existingLead.secondaryPhone,
+        countryCode: data.secondaryCountryCode || existingLead.secondaryCountryCode || '91',
+      },
+      {
+        field: 'tertiaryPhone' as const,
+        value: data.tertiaryPhone,
+        previous: existingLead.tertiaryPhone,
+        countryCode: data.tertiaryCountryCode || existingLead.tertiaryCountryCode || '91',
+      },
+    ].filter((phone) => (
+      phone.value !== undefined
+      && phone.value !== null
+      && phone.value !== ''
+      && phone.value !== phone.previous
+    ));
+    if (changedPhones.length) {
+      const phoneValidationErrors = validateLeadContactInput({
+        phones: changedPhones.map((phone) => ({
+          field: phone.field,
+          value: phone.value,
+          countryCode: phone.countryCode,
+        })),
+        emails: [],
+      });
+      if (phoneValidationErrors.length) {
+        return res.status(400).json({
+          success: false,
+          error: 'Please correct the highlighted contact details.',
+          fieldErrors: phoneValidationErrors,
+        });
       }
-      data.phone = phoneToCheck;
+
+      for (const phone of changedPhones) {
+        const normalized = normalizeLeadPhone(phone.value, phone.countryCode);
+        if (!normalized) continue;
+        if (phone.field === 'phone') {
+          data.phone = normalized.e164;
+        } else if (phone.field === 'secondaryPhone') {
+          data.secondaryPhone = normalized.e164;
+          if (normalized.countryCode) data.secondaryCountryCode = `+${normalized.countryCode}`;
+        } else {
+          data.tertiaryPhone = normalized.e164;
+          if (normalized.countryCode) data.tertiaryCountryCode = `+${normalized.countryCode}`;
+        }
+      }
     }
 
     if (data.status) {
@@ -1383,9 +1419,43 @@ router.put('/:id', authorize('Lead', 'edit'), async (req: AuthRequest, res: Resp
     const ownerChanged =
       'ownerId' in updateData &&
       normalizeDiffValue(updateData.ownerId) !== normalizeDiffValue(existingLead.ownerId);
-    const shouldReassign = hasLeadAssignmentRelevantChanges(updateData);
+    const projectChanged = Object.prototype.hasOwnProperty.call(updateData, 'projectId');
+    const shouldReassign = !projectChanged && hasLeadAssignmentRelevantChanges(updateData);
     const bookedStatusTransition = updateData.status === 'BOOKED' && existingLead.status !== 'BOOKED';
     const result = await prisma.$transaction(async (tx) => {
+      if (changedPhones.length) {
+        const duplicateInput = {
+          phones: changedPhones.map((phone) => ({
+            field: phone.field,
+            value: phone.value,
+            countryCode: phone.countryCode,
+          })),
+          emails: [],
+        };
+        await acquireLeadDuplicateLocks(tx, existingLead.tenantId, duplicateInput);
+        const duplicateMatches = await findLeadDuplicates(tx, existingLead.tenantId, duplicateInput);
+        const phoneConflicts = changedPhones.flatMap((phone) => {
+          const normalized = normalizeLeadPhone(phone.value, phone.countryCode);
+          const match = duplicateMatches.find((candidate) => (
+            candidate.lead.id !== existingLead.id
+            && normalized
+            && candidate.evidence.some((item) => item.contactKey === `PHONE:${normalized.e164}`)
+          ));
+          return match
+            ? [{
+                field: phone.field,
+                message: `Lead with the same phone number already exists: ${match.lead.leadNumber || match.lead.id}`,
+              }]
+            : [];
+        });
+        if (phoneConflicts.length) {
+          throw Object.assign(new Error(phoneConflicts[0].message), {
+            code: 'DUPLICATE_LEAD_PHONE',
+            fieldErrors: phoneConflicts,
+          });
+        }
+      }
+
       let assignment: Awaited<ReturnType<typeof assignLeadToProjectRoundRobinInTransaction>> | null = null;
       let salesHandoff: Awaited<ReturnType<typeof assignCompletedSiteVisitToSalesInTransaction>> | null = null;
       if (updateData.status === 'LOST' && existingLead.status !== 'LOST') {
@@ -1534,6 +1604,13 @@ router.put('/:id', authorize('Lead', 'edit'), async (req: AuthRequest, res: Resp
     if (error.name === 'ZodError') {
       return res.status(400).json({ success: false, error: error.errors[0].message });
     }
+    if (error?.code === 'DUPLICATE_LEAD_PHONE') {
+      return res.status(409).json({
+        success: false,
+        error: error.message,
+        fieldErrors: error.fieldErrors,
+      });
+    }
     if (error?.message === 'RR_PROJECT_REQUIRED') {
       return res.status(409).json({ success: false, error: 'A project is required for this round-robin assignment.' });
     }
@@ -1581,8 +1658,8 @@ router.delete('/:id', authorize('Lead', 'delete'), async (req: AuthRequest, res:
       return res.status(404).json({ success: false, error: 'Lead not found' });
     }
 
-    if (!(await canAccessLead(req.user!, lead))) {
-      return res.status(403).json({ success: false, error: 'You do not have access to this lead' });
+    if (!(await canEditLead(req.user!, lead))) {
+      return res.status(403).json({ success: false, error: 'This lead is read-only for your user.' });
     }
 
     await prisma.auditLog.create({
@@ -1655,8 +1732,8 @@ router.post('/:id/push-to-svc', authorize('Lead', 'edit'), async (req: AuthReque
       return res.status(404).json({ success: false, error: 'Lead not found' });
     }
 
-    if (!(await canAccessLead(req.user!, lead))) {
-      return res.status(403).json({ success: false, error: 'You do not have access to this lead' });
+    if (!(await canEditLead(req.user!, lead))) {
+      return res.status(403).json({ success: false, error: 'This lead is read-only for your user.' });
     }
 
     if (lead.status !== 'INCOMING') {
@@ -1803,14 +1880,24 @@ router.post('/:id/move-to-recovery', async (req: AuthRequest, res: Response) => 
       return res.status(404).json({ success: false, error: 'Lead not found' });
     }
 
-    if (!(await canAccessLead(req.user!, lead))) {
-      return res.status(403).json({ success: false, error: 'You do not have access to this lead' });
+    if (!(await canEditLead(req.user!, lead))) {
+      return res.status(403).json({ success: false, error: 'This lead is read-only for your user.' });
     }
 
     if (lead.status === 'LOST') {
       return res.status(400).json({ success: false, error: 'Lead is already marked Lost.' });
     }
 
+    const actingUser = await prisma.user.findUnique({
+      where: { id: req.user!.id },
+      select: { firstName: true, lastName: true },
+    });
+    if (!actingUser) {
+      return res.status(401).json({ success: false, error: 'Unable to identify the user moving this lead to Recovery.' });
+    }
+
+    const unqualifiedAt = new Date();
+    const unqualifiedBy = [actingUser.firstName, actingUser.lastName].filter(Boolean).join(' ');
     const result = await prisma.$transaction(async (tx) => {
       const assignment = await assignLeadToProjectRoundRobinInTransaction(tx, {
         tenantId: lead.tenantId,
@@ -1822,7 +1909,15 @@ router.post('/:id/move-to-recovery', async (req: AuthRequest, res: Response) => 
       });
       await tx.lead.update({
         where: { id: req.params.id },
-        data: { status: 'LOST', lostAt: new Date() },
+        data: {
+          status: 'LOST',
+          lostAt: unqualifiedAt,
+          customFields: updateSalesforceCustomFields(lead.customFields, {
+            Unqualified_Date__c: unqualifiedAt.toISOString(),
+            Unqualified_Reason__c: recoveryReason.trim(),
+            Unqualified_Lost_By__c: unqualifiedBy,
+          }),
+        },
       });
 
       await tx.auditLog.create({
@@ -1834,7 +1929,16 @@ router.post('/:id/move-to-recovery', async (req: AuthRequest, res: Response) => 
           objectType: 'Lead',
           objectId: lead.id,
           oldValues: { status: lead.status, ownerId: lead.ownerId },
-          newValues: { status: 'LOST', ownerId: assignment.assignedUserId, recoveryReason, recoveryNote: note, reason: recoveryReason },
+          newValues: {
+            status: 'LOST',
+            ownerId: assignment.assignedUserId,
+            recoveryReason: recoveryReason.trim(),
+            recoveryNote: note,
+            reason: recoveryReason.trim(),
+            Unqualified_Date__c: unqualifiedAt.toISOString(),
+            Unqualified_Reason__c: recoveryReason.trim(),
+            Unqualified_Lost_By__c: unqualifiedBy,
+          },
         },
       });
       await appendLeadProcessNote(tx, {
@@ -1904,8 +2008,8 @@ router.post('/:id/schedule-site-visit', authorize('Lead', 'edit'), async (req: A
       return res.status(404).json({ success: false, error: 'Lead not found' });
     }
 
-    if (!(await canAccessLead(req.user!, lead))) {
-      return res.status(403).json({ success: false, error: 'You do not have access to this lead' });
+    if (!(await canEditLead(req.user!, lead))) {
+      return res.status(403).json({ success: false, error: 'This lead is read-only for your user.' });
     }
 
     const profileName = req.user!.profileName || 'Admin';

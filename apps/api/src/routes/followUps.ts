@@ -1,7 +1,14 @@
 import { Router, Response } from 'express';
 import { prisma } from '@dct-crm/db';
 import { crmDateRangeBounds, formatCRMDateTime, followUpSchema } from '@dct-crm/shared';
-import { futureFollowUpError, getNextFollowUpNumber, presentFollowUp, resolveFollowUpLinks } from '../services/followUpService';
+import {
+  DuplicateScheduledFollowUpError,
+  ensureNoDuplicateScheduledFollowUp,
+  futureFollowUpError,
+  getNextFollowUpNumber,
+  presentFollowUp,
+  resolveFollowUpLinks,
+} from '../services/followUpService';
 import { authenticate, AuthRequest } from '../middleware/auth';
 import { listOrderBy, listViewConstraint, mergeListWhere } from '../services/listViewService';
 import { authorize } from '../middleware/authorization';
@@ -220,7 +227,9 @@ router.get('/:id', authorize('FollowUp', 'read'), async (req: AuthRequest, res: 
 router.post('/', authorize('FollowUp', 'create'), async (req: AuthRequest, res: Response) => {
   try {
     const data = followUpSchema.parse(req.body);
-    const scheduleError = data.status === 'CANCELLED' ? null : futureFollowUpError(data.dueDate);
+    const scheduleError = (data.status || 'SCHEDULED') === 'SCHEDULED'
+      ? futureFollowUpError(data.dueDate)
+      : null;
     if (scheduleError) return res.status(400).json({ success: false, error: scheduleError });
     const links = await resolveFollowUpLinks(prisma, req.tenantId!, data);
     if ('error' in links) return res.status(400).json({ success: false, error: links.error });
@@ -236,8 +245,15 @@ router.post('/', authorize('FollowUp', 'create'), async (req: AuthRequest, res: 
     if (!activeOwner) {
       return res.status(400).json({ success: false, error: 'Assigned user is not active in this company' });
     }
+    const status = data.status || 'SCHEDULED';
 
     const followUp = await prisma.$transaction(async (tx) => {
+      if (links.leadId && status === 'SCHEDULED') {
+        await ensureNoDuplicateScheduledFollowUp(tx, {
+          tenantId: req.tenantId!,
+          leadId: links.leadId,
+        });
+      }
       const followUpNumber = await getNextFollowUpNumber(tx, req.tenantId!);
       const created = await tx.followUp.create({
         data: {
@@ -251,9 +267,11 @@ router.post('/', authorize('FollowUp', 'create'), async (req: AuthRequest, res: 
           previousDisposition: data.previousDisposition || null,
           cancelledReason: data.cancelledReason || null,
           dueDate: new Date(data.dueDate),
-          isMissed: false,
-          missedAt: null,
-          status: data.status || 'SCHEDULED',
+          completedAt: status === 'COMPLETED' ? new Date() : null,
+          isCompleted: status === 'COMPLETED',
+          isMissed: status === 'MISSED',
+          missedAt: status === 'MISSED' ? new Date() : null,
+          status,
           awaitedFollowUp: data.awaitedFollowUp || false,
           isSystemCancelled: data.isSystemCancelled || false,
           testCheckbox: data.testCheckbox || false,
@@ -276,7 +294,9 @@ router.post('/', authorize('FollowUp', 'create'), async (req: AuthRequest, res: 
           profileName: req.user!.profileName,
           activityLabel: 'Follow-up',
         });
-        await tagLeadFollowUpEvents(tx, req.tenantId!, links.leadId);
+        await tagLeadFollowUpEvents(tx, req.tenantId!, links.leadId, {
+          transitionToScheduled: status === 'SCHEDULED',
+        });
         const dueDateLabel = formatCRMDateTime(new Date(data.dueDate), await getTenantTimezone(req.tenantId!));
         await appendLeadProcessNote(tx, {
           tenantId: req.tenantId!,
@@ -310,6 +330,9 @@ router.post('/', authorize('FollowUp', 'create'), async (req: AuthRequest, res: 
     if (error.name === 'ZodError') {
       return res.status(400).json({ success: false, error: error.errors[0].message });
     }
+    if (error instanceof DuplicateScheduledFollowUpError) {
+      return res.status(409).json({ success: false, error: error.message });
+    }
     console.error('Create follow-up error:', error);
     res.status(500).json({ success: false, error: 'Failed to create follow-up' });
   }
@@ -326,7 +349,7 @@ router.put('/:id', authorize('FollowUp', 'edit'), async (req: AuthRequest, res: 
     }
 
     const data = followUpSchema.partial().parse(req.body);
-    if (data.dueDate) {
+    if (data.dueDate && (data.status || existingFollowUp.status) === 'SCHEDULED') {
       const scheduleError = futureFollowUpError(data.dueDate);
       if (scheduleError) return res.status(400).json({ success: false, error: scheduleError });
     }
@@ -351,6 +374,9 @@ router.put('/:id', authorize('FollowUp', 'edit'), async (req: AuthRequest, res: 
     if ('error' in links) return res.status(400).json({ success: false, error: links.error });
     const updateData: any = { ...data, leadId: links.leadId, enquiryId: links.enquiryId, bookingId: links.bookingId };
     if (data.dueDate) updateData.dueDate = new Date(data.dueDate);
+    if (data.status && data.status !== existingFollowUp.status && data.isSystemCancelled !== true) {
+      updateData.isSystemCancelled = false;
+    }
     if (data.status === 'COMPLETED') {
       updateData.isCompleted = true;
       updateData.completedAt = existingFollowUp.completedAt || new Date();
@@ -358,16 +384,39 @@ router.put('/:id', authorize('FollowUp', 'edit'), async (req: AuthRequest, res: 
       updateData.missedAt = null;
     } else if (data.status === 'CANCELLED') {
       updateData.isCompleted = false;
+      updateData.completedAt = null;
       updateData.isMissed = false;
       updateData.missedAt = null;
-    } else if (data.dueDate || data.status === 'SCHEDULED') {
+    } else if (data.status === 'MISSED') {
+      updateData.isCompleted = false;
+      updateData.completedAt = null;
+      updateData.isMissed = true;
+      updateData.missedAt = existingFollowUp.missedAt || new Date();
+    } else if (
+      data.status === 'SCHEDULED'
+      || (
+        data.dueDate
+        && !existingFollowUp.isCompleted
+        && ['SCHEDULED', 'MISSED'].includes(existingFollowUp.status)
+      )
+    ) {
       const dueDate = data.dueDate ? new Date(data.dueDate) : existingFollowUp.dueDate;
-      updateData.isMissed = !existingFollowUp.isCompleted && dueDate <= new Date();
+      updateData.isCompleted = false;
+      updateData.completedAt = null;
+      updateData.isMissed = dueDate <= new Date();
       updateData.missedAt = updateData.isMissed ? new Date() : null;
-      if (!data.status) updateData.status = updateData.isMissed ? 'MISSED' : 'SCHEDULED';
+      updateData.status = updateData.isMissed ? 'MISSED' : 'SCHEDULED';
     }
 
     const followUp = await prisma.$transaction(async (tx) => {
+      const resultingStatus = updateData.status ?? existingFollowUp.status;
+      if (links.leadId && resultingStatus === 'SCHEDULED') {
+        await ensureNoDuplicateScheduledFollowUp(tx, {
+          tenantId: req.tenantId!,
+          leadId: links.leadId,
+          excludeId: existingFollowUp.id,
+        });
+      }
       const updated = await tx.followUp.update({
         where: { id: req.params.id },
         data: updateData,
@@ -399,9 +448,11 @@ router.put('/:id', authorize('FollowUp', 'edit'), async (req: AuthRequest, res: 
           });
         }
       }
-      for (const leadId of new Set([existingFollowUp.leadId, updated.leadId].filter((id): id is string => !!id))) {
-        await tagLeadFollowUpEvents(tx, req.tenantId!, leadId);
-      }
+      await tagLeadFollowUpEvents(tx, req.tenantId!, [existingFollowUp.leadId, updated.leadId], {
+        transitionToScheduled:
+          (updateData.status ?? existingFollowUp.status) === 'SCHEDULED'
+          && existingFollowUp.status !== 'SCHEDULED',
+      });
       return updated;
     });
 
@@ -409,6 +460,9 @@ router.put('/:id', authorize('FollowUp', 'edit'), async (req: AuthRequest, res: 
   } catch (error: any) {
     if (error.name === 'ZodError') {
       return res.status(400).json({ success: false, error: error.errors[0].message });
+    }
+    if (error instanceof DuplicateScheduledFollowUpError) {
+      return res.status(409).json({ success: false, error: error.message });
     }
     console.error('Update follow-up error:', error);
     res.status(500).json({ success: false, error: 'Failed to update follow-up' });
@@ -551,7 +605,9 @@ router.put('/:id/reopen', authorize('FollowUp', 'edit'), async (req: AuthRequest
           userId: req.user!.id,
           content: `Follow-up reopened: ${followUp.title}`,
         });
-        await tagLeadFollowUpEvents(tx, req.tenantId!, followUp.leadId);
+        await tagLeadFollowUpEvents(tx, req.tenantId!, followUp.leadId, {
+          transitionToScheduled: updated.status === 'SCHEDULED' && followUp.status !== 'SCHEDULED',
+        });
       }
       return updated;
     });

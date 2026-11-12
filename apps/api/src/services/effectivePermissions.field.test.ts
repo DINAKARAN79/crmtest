@@ -25,6 +25,9 @@ vi.mock('@dct-crm/db', () => ({
     permissionSet: {
       findMany: vi.fn(),
     },
+    profilePermissionSetAssignment: {
+      findMany: vi.fn(),
+    },
     userPermissionAssignment: {
       findMany: vi.fn(),
     },
@@ -45,6 +48,7 @@ import { reconcileObjectPermissionsForPermissionIds, reconcilePermissionIdsForOb
 describe('effective field permissions', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    vi.mocked(prisma.profilePermissionSetAssignment.findMany).mockResolvedValue([] as any);
     const telephonyPermission: Permission = {
       id: 'perm-telephony-call',
       name: 'TELEPHONY_CALL',
@@ -103,6 +107,42 @@ describe('effective field permissions', () => {
         canEdit: true,
         source: 'PERMISSION_SET',
         sourceName: 'Sales Extra',
+      }),
+    ]);
+  });
+
+  it('merges field grants from Permission Sets assigned to the user profile', async () => {
+    vi.mocked(prisma.user.findUnique).mockResolvedValue({
+      id: 'user-1',
+      profileId: 'profile-1',
+      tenantId: 'tenant-1',
+      isActive: true,
+      isSuperAdmin: false,
+    } as any);
+    vi.mocked(prisma.profileFieldPermission.findMany).mockResolvedValue([] as any);
+    vi.mocked(prisma.userPermissionAssignment.findMany).mockResolvedValue([] as any);
+    vi.mocked(prisma.profilePermissionSetAssignment.findMany).mockResolvedValue([
+      {
+        permissionSet: {
+          name: 'Profile Lead Fields',
+          fieldPermissions: [{
+            field: { id: 'field-1', name: 'Private Notes' },
+            canRead: true,
+            canEdit: false,
+          }],
+        },
+      },
+    ] as any);
+    vi.mocked(prisma.userRole.findMany).mockResolvedValue([] as any);
+
+    await expect(EffectivePermissionService.getEffectiveFieldPermissions('user-1', 'object-1')).resolves.toEqual([
+      expect.objectContaining({
+        fieldId: 'field-1',
+        fieldName: 'Private Notes',
+        canRead: true,
+        canEdit: false,
+        source: 'PERMISSION_SET',
+        sourceName: 'Profile Lead Fields',
       }),
     ]);
   });
@@ -313,6 +353,7 @@ describe('effective profile permissions', () => {
   beforeEach(() => {
     vi.restoreAllMocks();
     vi.clearAllMocks();
+    vi.mocked(prisma.profilePermissionSetAssignment.findMany).mockResolvedValue([] as any);
   });
 
   it('includes object grants from the profile permission sets without requiring a role', async () => {
@@ -360,6 +401,37 @@ describe('effective profile permissions', () => {
       'UNIT_UPDATE',
       'UNIT_DELETE',
     ]);
+  });
+
+  it('includes assigned modern Permission Set grants for every user of a profile', async () => {
+    vi.mocked(prisma.userProfilePermission.findMany).mockResolvedValue([]);
+    vi.mocked(prisma.permissionSet.findMany).mockResolvedValue([] as any);
+    vi.mocked(prisma.profileObjectPermission.findMany).mockResolvedValue([]);
+    vi.mocked(prisma.profilePermissionSetAssignment.findMany).mockResolvedValue([
+      {
+        permissionSet: {
+          name: 'Lead Editors',
+          items: [{ permission: { name: 'LEAD_UPDATE', module: 'LEAD', action: 'UPDATE' } }],
+          objectPermissions: [{
+            object: { name: 'Lead', isActive: true },
+            canRead: true,
+            canCreate: false,
+            canUpdate: false,
+            canDelete: false,
+            viewAll: true,
+            modifyAll: false,
+          }],
+        },
+      },
+    ] as any);
+
+    const result = await EffectivePermissionService.getProfilePermissions('profile-sales', 'tenant-1');
+
+    expect(result).toEqual(expect.arrayContaining([
+      expect.objectContaining({ name: 'LEAD_UPDATE', source: 'PERMISSION_SET', sourceName: 'Lead Editors' }),
+      expect.objectContaining({ name: 'LEAD_READ', source: 'PERMISSION_SET', sourceName: 'Lead Editors' }),
+      expect.objectContaining({ name: 'LEAD_VIEW_ALL', source: 'PERMISSION_SET', sourceName: 'Lead Editors' }),
+    ]));
   });
 });
 

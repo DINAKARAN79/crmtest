@@ -258,6 +258,7 @@ model Profile {
 
   users              User[]
   permissionSets     PermissionSet[]
+  assignedPermissionSets ProfilePermissionSetAssignment[]
   profilePermissions UserProfilePermission[]
   objectPermissions  ProfileObjectPermission[]
   fieldPermissions   ProfileFieldPermission[]
@@ -328,17 +329,32 @@ model NewPermissionSet {
   name        String
   description String?
   isActive    Boolean  @default(true)
+  expiresAt   DateTime? @map("expires_at")
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
 
   items             NewPermissionSetItem[]
   userAssignments   UserPermissionAssignment[]
+  profileAssignments ProfilePermissionSetAssignment[]
   objectPermissions PermissionSetObjectPermission[]
   fieldPermissions  PermissionSetFieldPermission[]
   groupItems        PermissionSetGroupItem[]
 
   @@unique([tenantId, name])
   @@index([tenantId])
+}
+
+model ProfilePermissionSetAssignment {
+  id              String           @id @default(cuid())
+  profileId       String
+  profile         Profile          @relation(fields: [profileId], references: [id], onDelete: Cascade)
+  permissionSetId String
+  permissionSet   NewPermissionSet @relation(fields: [permissionSetId], references: [id], onDelete: Cascade)
+  createdAt       DateTime         @default(now())
+
+  @@unique([profileId, permissionSetId])
+  @@index([profileId])
+  @@index([permissionSetId])
 }
 
 model NewPermissionSetItem {
@@ -445,6 +461,8 @@ model PermissionSetObjectPermission {
   canDelete       Boolean          @default(false)
   viewAll         Boolean          @default(false)
   modifyAll       Boolean          @default(false)
+  canViewAll      Boolean          @default(false) @map("can_view_all")
+  canEditAll      Boolean          @default(false) @map("can_edit_all")
   createdAt       DateTime         @default(now())
   updatedAt       DateTime         @updatedAt
 

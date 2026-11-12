@@ -3,7 +3,7 @@ import { createHash } from 'crypto';
 import rateLimit from 'express-rate-limit';
 import bcrypt from 'bcryptjs';
 import { prisma } from '@dct-crm/db';
-import { loginSchema } from '@dct-crm/shared';
+import { CRM_SIDEBAR_ITEMS, loginSchema } from '@dct-crm/shared';
 import jwt from 'jsonwebtoken';
 import { generateToken, authenticate, AuthRequest } from '../middleware/auth';
 import {
@@ -101,6 +101,18 @@ function buildObjectPermissionMap(effectivePermissions: Array<{ name: string; mo
   }
 
   return permissions;
+}
+
+function getSidebarAccess(leadStatusAccess: unknown, isAdmin: boolean): string[] | null {
+  if (!leadStatusAccess || typeof leadStatusAccess !== 'object' || Array.isArray(leadStatusAccess)) return null;
+
+  const sidebarAccess = (leadStatusAccess as Record<string, unknown>).sidebarAccess;
+  if (!Array.isArray(sidebarAccess)) return null;
+  const allowedItems = new Set<string>(CRM_SIDEBAR_ITEMS.map(({ id }) => id));
+  const configuredItems = new Set(sidebarAccess.filter((item): item is string => typeof item === 'string' && allowedItems.has(item)));
+  configuredItems.add('home');
+  if (isAdmin) configuredItems.add('setup');
+  return [...configuredItems];
 }
 
 router.post('/login', loginLimiter, async (req: Request, res: Response) => {
@@ -222,7 +234,7 @@ router.post('/login', loginLimiter, async (req: Request, res: Response) => {
           avatar: user.avatar,
           isSuperAdmin: user.isSuperAdmin,
         },
-        profile: user.profile ? { ...user.profile, isAdmin: !!user.profile.isAdmin } : null,
+        profile: user.profile ? { ...user.profile, sidebarAccess: getSidebarAccess(user.profile.leadStatusAccess, !!user.profile.isAdmin), isAdmin: !!user.profile.isAdmin } : null,
         tenant: {
           ...user.tenant,
           companyLifecycleStatus,
@@ -641,7 +653,7 @@ router.get('/me', authenticate, async (req: AuthRequest, res: Response) => {
           isSuperAdmin: user.isSuperAdmin,
           impersonatedBy: req.user?.impersonatedBy || null,
         },
-        profile: user.profile ? { ...user.profile, isAdmin: !!user.profile.isAdmin } : null,
+        profile: user.profile ? { ...user.profile, sidebarAccess: getSidebarAccess(user.profile.leadStatusAccess, !!user.profile.isAdmin), isAdmin: !!user.profile.isAdmin } : null,
         tenant: user.tenant ? {
           ...user.tenant,
           companyLifecycleStatus,

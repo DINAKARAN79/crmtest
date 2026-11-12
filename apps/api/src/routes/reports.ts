@@ -10,10 +10,20 @@ import { authorize } from '../middleware/authorization';
 import { loadEffectivePermissions } from '../middleware/permissions';
 import { auditLog } from '../middleware/audit';
 import { REPORT_OBJECTS, getReportMetadataRegistry } from '../reports/report-metadata';
-import { runReport, parseFilterExpression, canAccessReportForUser, canAccessReportFolderForUser } from '../reports/report-engine';
+import {
+  runReport,
+  parseFilterExpression,
+  canAccessReportForUser,
+  canAccessReportFolderForUser,
+  canViewEmbeddedDashboardReport,
+} from '../reports/report-engine';
 import { followUpReportShowMe } from '../services/followUpAccess';
 import { createReportCsv, reportCsvFilename } from '../reports/report-csv-export';
-import { resolveReportShowMe } from '../services/recordAccess';
+import {
+  applyScope,
+  getReportRecordAccessClause,
+  resolveReportShowMe,
+} from '../services/recordAccess';
 
 const router = Router();
 export const reportFolderRouter = Router();
@@ -87,7 +97,11 @@ router.get('/field-values', authorize('Report', 'read'), async (req: AuthRequest
     };
     const getValue = (record: any, path: string) => path.split('.').reduce((current, key) => current?.[key], record);
     const delegate = (prisma as any)[objectConfig.model];
-    const records = await delegate.findMany({ where: { tenantId: req.tenantId! }, select: selectPath(field.path), take: 1000 });
+    const where = applyScope(
+      { tenantId: req.tenantId! },
+      await getReportRecordAccessClause(req.user!, objectName),
+    );
+    const records = await delegate.findMany({ where, select: selectPath(field.path), take: 1000 });
     const values = [...new Set(records.map((record: any) => getValue(record, field.path)).filter((value: unknown) => value !== null && value !== undefined && value !== ''))].sort();
     res.json({ success: true, data: values });
   } catch (error: any) {
@@ -125,7 +139,7 @@ router.post('/run', authorize('Report', 'read'), async (req: AuthRequest, res: R
     }
     const filterTree = typeof filterExpression === 'string' && filterExpression.trim() ? parseFilterExpression(filterExpression, filters?.length || 0) : undefined;
     const forcedShowMe = followUpReportShowMe(objectName, req.user!, await resolveReportShowMe(req.user!, showMe));
-    const data = await runReport({ tenantId: req.tenantId!, userId: req.user!.id, objectName, columns, filters, filterTree, showMe: forcedShowMe, crossFilter, filterLogic, aggregates, groupBy, groupColumn, rowGroups, columnGroups, groupOptions, sortBy, sortOrder, sortRules, limit });
+    const data = await runReport({ tenantId: req.tenantId!, userId: req.user!.id, user: req.user!, objectName, columns, filters, filterTree, showMe: forcedShowMe, crossFilter, filterLogic, aggregates, groupBy, groupColumn, rowGroups, columnGroups, groupOptions, sortBy, sortOrder, sortRules, limit });
     res.json({ success: true, data });
   } catch (error: any) {
     console.error('Run report error:', error);
@@ -154,6 +168,98 @@ async function getReportShare(reportId: string, req: AuthRequest) {
 async function ensureReportAccessWithShare(report: { id: string; createdBy?: string | null; isShared?: boolean | null; tenantId?: string | null } | null, req: AuthRequest) {
   if (ensureReportAccess(report, req)) return true;
   return Boolean(report && await getReportShare(report.id, req));
+}
+
+async function ensureReportAccessFromDashboard(
+  report: { id: string; tenantId?: string | null } | null,
+  req: AuthRequest,
+) {
+  if (!report || report.tenantId !== req.tenantId!) return false;
+  const permissions = req.effectivePermissions?.map((permission) => permission.name) || [];
+  if (
+    !permissions.includes('DASHBOARD_READ') ||
+    (!permissions.includes('REPORT_VIEW') && !permissions.includes('REPORT_READ'))
+  ) {
+    return false;
+  }
+
+  const roleIds = (await prisma.userRole.findMany({
+    where: { userId: req.user!.id },
+    select: { roleId: true },
+  })).map((role) => role.roleId);
+  const dashboardShareTargets = [
+    { userId: req.user!.id },
+    ...(roleIds.length
+      ? [
+          { roleId: { in: roleIds } },
+          { teamId: { in: roleIds } },
+        ]
+      : []),
+  ];
+
+  const assignedHomepages = req.user!.profileId
+    ? await prisma.dashboard.findMany({
+        where: {
+          tenantId: req.tenantId!,
+          isActive: true,
+          sharedProfiles: { some: { profileId: req.user!.profileId } },
+        },
+        select: { layout: true },
+      })
+    : [];
+  const dashboardIdsFromHomepages = assignedHomepages.flatMap((homepage) =>
+    Array.isArray(homepage.layout)
+      ? homepage.layout.flatMap((item) => {
+          const widgetId =
+            typeof item === 'string'
+              ? item
+              : item && typeof item === 'object' && 'id' in item
+                ? item.id
+                : undefined;
+          return typeof widgetId === 'string' && widgetId.startsWith('dashboard-')
+            ? [widgetId.slice('dashboard-'.length)]
+            : [];
+        })
+      : [],
+  );
+  const accessibleDashboards = await prisma.dashboard.findMany({
+    where: {
+      tenantId: req.tenantId!,
+      OR: [
+        { ownerId: req.user!.id },
+        { createdBy: req.user!.id },
+        { visibility: { in: ['SHARED', 'PUBLIC'] } },
+        { isDefault: true },
+        ...(req.user!.profileId
+          ? [{ sharedProfiles: { some: { profileId: req.user!.profileId } } }]
+          : []),
+        {
+          shares: {
+            some: {
+              tenantId: req.tenantId!,
+              OR: dashboardShareTargets,
+              accessLevel: { in: ['VIEW', 'EDIT', 'SHARE', 'DELETE', 'MANAGE'] },
+            },
+          },
+        },
+        ...(dashboardIdsFromHomepages.length
+          ? [{ id: { in: dashboardIdsFromHomepages } }]
+          : []),
+      ],
+    },
+    select: { id: true, tenantId: true, layout: true },
+  });
+
+  return accessibleDashboards.some((dashboard) =>
+    canViewEmbeddedDashboardReport(
+      report.id,
+      dashboard.layout,
+      report.tenantId || '',
+      dashboard.tenantId,
+      req.tenantId!,
+      permissions,
+    ),
+  );
 }
 
 async function ensureReportEditAccess(report: { id: string; createdBy?: string | null; isShared?: boolean | null; tenantId?: string | null } | null, req: AuthRequest) {
@@ -314,7 +420,10 @@ router.get('/:id', authorize('Report', 'read'), async (req: AuthRequest, res: Re
       return res.status(404).json({ success: false, error: 'Report not found' });
     }
 
-    if (!(await ensureReportAccessWithShare(report, req))) {
+    if (
+      !(await ensureReportAccessWithShare(report, req)) &&
+      !(await ensureReportAccessFromDashboard(report, req))
+    ) {
       return res.status(403).json({ success: false, error: 'Access denied: report is not shared with you' });
     }
 
@@ -461,6 +570,7 @@ router.get('/:id/export', authorize('Report', 'read'), async (req: AuthRequest, 
     const result = await runReport({
       tenantId,
       userId: req.user!.id,
+      user: req.user!,
       objectName: report.objectName,
       columns: Array.isArray(report.columns) ? report.columns as string[] : [],
       filters: Array.isArray(report.filters) ? report.filters as any[] : [],
@@ -845,7 +955,10 @@ router.post('/:id/execute', authorize('Report', 'read'), async (req: AuthRequest
       return res.status(404).json({ success: false, error: 'Report not found' });
     }
 
-    if (!(await ensureReportAccessWithShare(report, req))) {
+    if (
+      !(await ensureReportAccessWithShare(report, req)) &&
+      !(await ensureReportAccessFromDashboard(report, req))
+    ) {
       return res.status(403).json({ success: false, error: 'Access denied: report is not shared with you' });
     }
 
@@ -871,9 +984,15 @@ router.post('/:id/execute', authorize('Report', 'read'), async (req: AuthRequest
     const scopeClause = forcedShowMe === 'mine' && req.user
       ? { ownerId: req.user.id }
       : null;
-    const where: any = scopeClause
-      ? { tenantId, AND: [{ ...filters }, scopeClause] }
-      : { tenantId, ...filters };
+    const recordAccessClause = await getReportRecordAccessClause(req.user!, report.objectName);
+    const where: any = {
+      tenantId,
+      AND: [
+        filters,
+        ...(scopeClause ? [scopeClause] : []),
+        ...(recordAccessClause ? [recordAccessClause] : []),
+      ],
+    };
 
     const data = await model.findMany({
       where,

@@ -1,6 +1,7 @@
 import { Prisma, PrismaClient } from '@prisma/client';
 import { prisma } from '@dct-crm/db';
 import { createOwnerHistory } from './ownerHistory';
+import { moveScheduledChildrenToLeadOwner } from './leadReopenLifecycle';
 
 export type RRClient = Prisma.TransactionClient | PrismaClient;
 export type RRMemberUserType = 'Pre Sales' | 'Sales' | 'Post Sales' | 'Recovery' | 'Channel Partner' | 'SVC' | 'CRM';
@@ -191,7 +192,7 @@ export function isLeadEligibleForAutoAssignment(lead: Record<string, any> | null
 }
 
 export function hasLeadAssignmentRelevantChanges(updateData: Record<string, unknown>): boolean {
-  return ['status', 'ownerId', 'projectId', 'source'].some((field) =>
+  return ['status', 'ownerId', 'source'].some((field) =>
     Object.prototype.hasOwnProperty.call(updateData, field),
   );
 }
@@ -406,7 +407,15 @@ export class RoundRobinAssignmentService {
       where: { id: lead.id },
       data: { ownerId: member.userId, rrQueueId: queue.id },
     });
-
+    if (lead.ownerId !== member.userId) {
+      await moveScheduledChildrenToLeadOwner(tx, {
+        tenantId,
+        leadId: lead.id,
+        newOwnerId: member.userId,
+        leadStatus: lead.status,
+        customFields: lead.customFields,
+      });
+    }
     if (lead.ownerId !== member.userId) {
       await createOwnerHistory({
         tenantId,
@@ -667,6 +676,15 @@ export async function assignLeadToProjectRoundRobinInTransaction(
       ...(params.leadStatus ? { status: params.leadStatus as typeof lead.status } : {}),
     },
   });
+  if (lead.ownerId !== member.userId) {
+    await moveScheduledChildrenToLeadOwner(tx, {
+      tenantId: params.tenantId,
+      leadId: lead.id,
+      newOwnerId: member.userId,
+      leadStatus: nextStatus,
+      customFields: lead.customFields,
+    });
+  }
   if (lead.ownerId !== member.userId || nextStatus !== lead.status) {
     await createOwnerHistory({
       tenantId: params.tenantId,

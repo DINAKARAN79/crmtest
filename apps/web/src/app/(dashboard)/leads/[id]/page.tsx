@@ -163,6 +163,7 @@ interface LeadData {
   lastCampaign?: string | null;
   leadInterest?: string | null;
   status: string;
+  readOnly?: boolean;
   statusId?: string;
   statusLabel?: string;
   rating?: string;
@@ -353,11 +354,10 @@ export default function LeadDetailPage() {
   useTelephonyNumberMasking();
   const { toast } = useToast();
   const leadId = params.id as string;
-  const canEditLead = hasPermission("Lead", "edit") || isAdmin || isSuperAdmin;
+  const [lead, setLead] = React.useState<LeadData | null>(null);
+  const canEditLead = (hasPermission("Lead", "edit") || isAdmin || isSuperAdmin) && !lead?.readOnly;
   const canEditLeadLayout = isSuperAdmin || (isAdmin && hasEffectivePermission("PROFILE_PERMISSION_MANAGE"));
   const canChangeOwner = canEditLead;
-
-  const [lead, setLead] = React.useState<LeadData | null>(null);
   const status = lead?.status || "";
   const [loadError, setLoadError] = React.useState<string | null>(null);
   const [isLoading, setIsLoading] = React.useState(true);

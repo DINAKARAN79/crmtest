@@ -5,10 +5,17 @@ import { z } from 'zod';
 import { authenticate, AuthRequest } from '../middleware/auth';
 import { authorize } from '../middleware/authorization';
 import { loadEffectivePermissions } from '../middleware/permissions';
-import { canAccessReportForUser, runReport } from '../reports/report-engine';
+import {
+  canAccessReportForUser,
+  canViewDashboardByProfile,
+  canViewDashboardFromProfileHomepage,
+  canViewEmbeddedDashboardReport,
+  runReport,
+} from '../reports/report-engine';
 import { auditLog } from '../middleware/audit';
 import PDFDocument from 'pdfkit';
-import { applyScope, getScopeClause } from '../services/recordAccess';
+import { applyScope, getScopeClause, resolveReportShowMe } from '../services/recordAccess';
+import { followUpReportShowMe } from '../services/followUpAccess';
 import { EffectivePermissionService } from '../services/effectivePermissions';
 import { getLeadStatusSettings } from '../services/leadStatusSettings';
 import { leadStatusIdFromValue } from '@dct-crm/shared';
@@ -265,10 +272,35 @@ async function canAccessDashboard(
   if (dashboard.tenantId !== req.tenantId!) return false;
   if (dashboard.ownerId === req.user!.id || dashboard.createdBy === req.user!.id) return true;
   if (minimum === 'VIEW') {
-    // Pre-merge behavior: the tenant's default dashboard was readable by every
-    // DASHBOARD_READ user. PUBLIC keeps friend's sharing model; isDefault
-    // preserves the existing home-dashboard read access (edit still owner/share only).
-    if (dashboard.visibility === 'PUBLIC' || dashboard.isDefault) return true;
+    // DASHBOARD_READ grants access to tenant-shared dashboards. Private dashboards
+    // remain restricted to their owner or explicit user/role shares.
+    if (dashboard.visibility === 'SHARED' || dashboard.visibility === 'PUBLIC' || dashboard.isDefault) return true;
+    if (req.user!.profileId) {
+      const profileShares = await prisma.dashboardProfileShare.findMany({
+        where: {
+          dashboardId: dashboard.id,
+          profile: { tenantId: req.tenantId! },
+        },
+        select: { profileId: true },
+      });
+      if (canViewDashboardByProfile(req.user!.profileId, profileShares.map((share) => share.profileId))) return true;
+      const assignedHomepages = await prisma.dashboard.findMany({
+        where: {
+          tenantId: req.tenantId!,
+          isActive: true,
+          sharedProfiles: { some: { profileId: req.user!.profileId } },
+        },
+        select: { layout: true },
+      });
+      if (
+        canViewDashboardFromProfileHomepage(
+          dashboard.id,
+          assignedHomepages.map((homepage) => homepage.layout),
+        )
+      ) {
+        return true;
+      }
+    }
   }
   const roleIds = await getRoleIds(req.user!.id);
   const share = await prisma.dashboardShare.findFirst({
@@ -297,6 +329,48 @@ async function getDashboardForRequest(id: string, req: AuthRequest) {
       subscriptions: { where: { userId: req.user!.id }, select: { id: true } },
     },
   });
+}
+
+async function canAccessDashboardReport(
+  report: { id: string; createdBy?: string | null; isShared?: boolean | null; tenantId?: string | null },
+  dashboard: { tenantId: string; layout: unknown },
+  req: AuthRequest,
+) {
+  const permissions = req.effectivePermissions?.map((permission) => permission.name) || [];
+  const user = {
+    id: req.user!.id,
+    tenantId: req.tenantId!,
+    isSuperAdmin: req.user!.isSuperAdmin,
+  };
+  if (canAccessReportForUser(report, user, permissions)) return true;
+  if (
+    report.tenantId !== req.tenantId! ||
+    dashboard.tenantId !== req.tenantId! ||
+    (!permissions.includes('REPORT_VIEW') && !permissions.includes('REPORT_READ'))
+  ) {
+    return false;
+  }
+
+  const roleIds = await getRoleIds(req.user!.id);
+  const share = await prisma.reportShare.findFirst({
+    where: {
+      reportId: report.id,
+      tenantId: req.tenantId!,
+      OR: [
+        { userId: req.user!.id },
+        ...(roleIds.length ? [{ roleId: { in: roleIds } }] : []),
+      ],
+    },
+    select: { id: true },
+  });
+  return Boolean(share) || canViewEmbeddedDashboardReport(
+    report.id,
+    dashboard.layout,
+    report.tenantId,
+    dashboard.tenantId,
+    req.tenantId!,
+    permissions,
+  );
 }
 
 router.get('/', authorize('Dashboard', 'read'), async (req: AuthRequest, res: Response) => {
@@ -331,12 +405,23 @@ router.get('/', authorize('Dashboard', 'read'), async (req: AuthRequest, res: Re
         select: { dashboardId: true },
       })
     ).map((share) => share.dashboardId);
+    const profileSharedIds = req.user!.profileId
+      ? (await prisma.dashboardProfileShare.findMany({
+          where: {
+            profileId: req.user!.profileId,
+            dashboard: { tenantId },
+          },
+          select: { dashboardId: true },
+        })).map((share) => share.dashboardId)
+      : [];
     const accessible = [
       { ownerId: req.user!.id },
       { createdBy: req.user!.id },
+      { visibility: 'SHARED' },
       { visibility: 'PUBLIC' },
       { isDefault: true },
       ...(sharedIds.length ? [{ id: { in: sharedIds } }] : []),
+      ...(profileSharedIds.length ? [{ id: { in: profileSharedIds } }] : []),
     ];
     if (allCompanies || viewingCompanyAsSuperAdmin) {
       // The company setup-home builder needs the selected company's own widgets.
@@ -345,7 +430,12 @@ router.get('/', authorize('Dashboard', 'read'), async (req: AuthRequest, res: Re
       where.OR = [{ ownerId: req.user!.id }, { createdBy: req.user!.id }];
       where.visibility = 'PRIVATE';
     }
-    else if (view === 'shared') where.OR = [{ id: { in: sharedIds } }];
+    else if (view === 'shared') {
+      where.OR = [
+        ...(sharedIds.length ? [{ id: { in: sharedIds } }] : []),
+        ...(profileSharedIds.length ? [{ id: { in: profileSharedIds } }] : []),
+      ];
+    }
     else if (view === 'favorites') where.favorites = { some: { userId: req.user!.id } };
     else where.OR = accessible;
     if (isDefault !== undefined) where.isDefault = isDefault === 'true';
@@ -1057,28 +1147,24 @@ router.get('/:id/export', authorize('Dashboard', 'read'), async (req: AuthReques
       const report = await prisma.report.findFirst({
         where: { id: reportId, tenantId: req.tenantId!, deletedAt: null },
       });
-      if (
-        !report ||
-        !canAccessReportForUser(
-          report,
-          {
-            id: req.user!.id,
-            tenantId: req.tenantId!,
-            isSuperAdmin: req.user!.isSuperAdmin,
-          },
-          req.effectivePermissions?.map((permission) => permission.name) || [],
-        )
-      )
+      if (!report || !(await canAccessDashboardReport(report, dashboard, req)))
         continue;
       const config = (report.config && typeof report.config === 'object' ? report.config : {}) as Record<string, any>;
+      const showMe = followUpReportShowMe(
+        report.objectName,
+        req.user!,
+        await resolveReportShowMe(req.user!, config.showMe),
+      );
       const result = await runReport({
         tenantId: req.tenantId!,
         userId: req.user!.id,
+        user: req.user!,
         objectName: report.objectName,
         columns: Array.isArray(report.columns) ? (report.columns as string[]) : [],
         filters: Array.isArray(report.filters) ? (report.filters as any[]) : [],
         filterTree: config.filterTree,
         filterLogic: config.filterLogic,
+        showMe,
         groupBy: report.groupBy || config.groupBy,
         sortBy: report.sortBy || config.sortBy,
         sortOrder: config.sortOrder,
@@ -1112,23 +1198,18 @@ router.get('/:id/export', authorize('Dashboard', 'read'), async (req: AuthReques
       const report = await prisma.report.findFirst({
         where: { id: reportId, tenantId: req.tenantId!, deletedAt: null },
       });
-      if (
-        !report ||
-        !canAccessReportForUser(
-          report,
-          {
-            id: req.user!.id,
-            tenantId: req.tenantId!,
-            isSuperAdmin: req.user!.isSuperAdmin,
-          },
-          req.effectivePermissions?.map((permission) => permission.name) || [],
-        )
-      )
+      if (!report || !(await canAccessDashboardReport(report, dashboard, req)))
         continue;
       const config = (report.config && typeof report.config === 'object' ? report.config : {}) as Record<string, any>;
+      const showMe = followUpReportShowMe(
+        report.objectName,
+        req.user!,
+        await resolveReportShowMe(req.user!, config.showMe),
+      );
       const result = await runReport({
         tenantId: req.tenantId!,
         userId: req.user!.id,
+        user: req.user!,
         objectName: report.objectName,
         columns: Array.isArray(report.columns) ? (report.columns as string[]) : [],
         filters: [
@@ -1137,6 +1218,7 @@ router.get('/:id/export', authorize('Dashboard', 'read'), async (req: AuthReques
         ],
         filterTree: config.filterTree,
         filterLogic: config.filterLogic,
+        showMe,
         groupBy: report.groupBy || config.groupBy,
         sortBy: report.sortBy || config.sortBy,
         sortOrder: config.sortOrder,
@@ -1196,18 +1278,7 @@ router.post(
       const report = await prisma.report.findFirst({
         where: { id: reportId, tenantId: req.tenantId!, deletedAt: null },
       });
-      if (
-        !report ||
-        !canAccessReportForUser(
-          report,
-          {
-            id: req.user!.id,
-            tenantId: req.tenantId!,
-            isSuperAdmin: req.user!.isSuperAdmin,
-          },
-          req.effectivePermissions?.map((permission) => permission.name) || [],
-        )
-      )
+      if (!report || !(await canAccessDashboardReport(report, dashboard, req)))
         return res.status(403).json({
           success: false,
           error: 'You do not have permission to view the selected report',
@@ -1220,9 +1291,15 @@ router.post(
           error: 'A data point field and value are required',
         });
       const config = (report.config && typeof report.config === 'object' ? report.config : {}) as Record<string, any>;
+      const showMe = followUpReportShowMe(
+        report.objectName,
+        req.user!,
+        await resolveReportShowMe(req.user!, config.showMe),
+      );
       const result = await runReport({
         tenantId: req.tenantId!,
         userId: req.user!.id,
+        user: req.user!,
         objectName: report.objectName,
         columns: Array.isArray(report.columns) ? (report.columns as string[]) : [],
         filters: [
@@ -1231,6 +1308,7 @@ router.post(
         ],
         filterTree: config.filterTree,
         filterLogic: config.filterLogic,
+        showMe,
         groupBy: report.groupBy || config.groupBy,
         sortBy: report.sortBy || config.sortBy,
         sortOrder: config.sortOrder,
@@ -1358,23 +1436,18 @@ router.post('/:id/widgets/:widgetId/data', authorize('Dashboard', 'read'), async
       if (!report) {
         return res.status(404).json({ success: false, error: 'Saved report not found' });
       }
-      if (
-        !canAccessReportForUser(
-          report,
-          {
-            id: req.user!.id,
-            tenantId: req.tenantId!,
-            isSuperAdmin: req.user!.isSuperAdmin,
-          },
-          req.effectivePermissions?.map((permission) => permission.name) || [],
-        )
-      ) {
+      if (!(await canAccessDashboardReport(report, dashboard, req))) {
         return res.status(403).json({
           success: false,
           error: 'You do not have permission to view the selected report',
         });
       }
       const config = (report.config && typeof report.config === 'object' ? report.config : {}) as Record<string, any>;
+      const showMe = followUpReportShowMe(
+        report.objectName,
+        req.user!,
+        await resolveReportShowMe(req.user!, config.showMe),
+      );
       const dashboardFilters = Array.isArray(req.body?.filters)
         ? req.body.filters
         : Array.isArray(dashboard.filters)
@@ -1383,6 +1456,7 @@ router.post('/:id/widgets/:widgetId/data', authorize('Dashboard', 'read'), async
       const result = await runReport({
         tenantId: req.tenantId!,
         userId: req.user!.id,
+        user: req.user!,
         objectName: report.objectName,
         columns: Array.isArray(report.columns) ? (report.columns as string[]) : [],
         filters: [
@@ -1393,6 +1467,7 @@ router.post('/:id/widgets/:widgetId/data', authorize('Dashboard', 'read'), async
         ],
         filterTree: config.filterTree,
         filterLogic: config.filterLogic,
+        showMe,
         aggregates: config.aggregates,
         groupBy: report.groupBy || config.groupBy,
         groupColumn: config.groupColumn,

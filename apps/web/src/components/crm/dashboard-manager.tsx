@@ -9,15 +9,19 @@ import {
   ChevronLeft,
   ChevronRight,
   Folder,
+  FolderOpen,
   Grid2X2,
+  Loader2,
   MoreHorizontal,
   Plus,
   RefreshCw,
+  Search,
   Star,
   X,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
 import { CommonFilterPanel, FilterSearch } from "@/components/crm/common-filter-panel";
 import { useAuth } from "@/contexts/auth-context";
 import { companyApi } from "@/lib/api";
@@ -115,8 +119,6 @@ export default function DashboardManager() {
     field: "name" | "createdAt";
     order: "asc" | "desc";
   }>({ field: "createdAt", order: "desc" });
-  const [menu, setMenu] = React.useState<string | null>(null);
-  const [folderMenu, setFolderMenu] = React.useState<string | null>(null);
   const [newOpen, setNewOpen] = React.useState(false);
   const [name, setName] = React.useState("");
   const [description, setDescription] = React.useState("");
@@ -144,6 +146,12 @@ export default function DashboardManager() {
   const [folderName, setFolderName] = React.useState("");
   const [movingDashboard, setMovingDashboard] =
     React.useState<Dashboard | null>(null);
+  const [moveFolderSearch, setMoveFolderSearch] = React.useState("");
+  const [moveFolders, setMoveFolders] = React.useState<FolderItem[]>([]);
+  const [moveFoldersLoading, setMoveFoldersLoading] = React.useState(false);
+  const [selectedMoveFolderId, setSelectedMoveFolderId] = React.useState("");
+  const [moveError, setMoveError] = React.useState("");
+  const [moving, setMoving] = React.useState(false);
 
   React.useEffect(() => {
     if (!isSuperAdmin) return;
@@ -253,14 +261,48 @@ export default function DashboardManager() {
     void loadFolders();
   }, [loadFolders]);
   React.useEffect(() => {
+    if (!movingDashboard) return;
+    let active = true;
+    const timer = window.setTimeout(() => {
+      void (async () => {
+        try {
+          setMoveFoldersLoading(true);
+          setMoveError("");
+          const params = new URLSearchParams({ view: "all" });
+          if (moveFolderSearch.trim()) params.set("search", moveFolderSearch.trim());
+          if (isSuperAdmin) params.set("scope", "allCompanies");
+          const data = await readResponse<FolderItem[]>(
+            await fetch(`/api/proxy/api/dashboards/folders?${params}`, {
+              cache: "no-store",
+            }),
+          );
+          if (active) {
+            setMoveFolders(
+              (Array.isArray(data) ? data : []).filter(
+                (folder) => folder.tenantId === movingDashboard.tenantId,
+              ),
+            );
+          }
+        } catch (err) {
+          if (active) {
+            setMoveFolders([]);
+            setMoveError(
+              err instanceof Error ? err.message : "Unable to load folders",
+            );
+          }
+        } finally {
+          if (active) setMoveFoldersLoading(false);
+        }
+      })();
+    }, 200);
+    return () => {
+      active = false;
+      window.clearTimeout(timer);
+    };
+  }, [isSuperAdmin, moveFolderSearch, movingDashboard]);
+  React.useEffect(() => {
     setPage(1);
   }, [debouncedSearch, selectedFolderId, view, folderView]);
-  React.useEffect(() => {
-    const close = () => setMenu(null);
-    window.addEventListener("click", close);
-    return () => window.removeEventListener("click", close);
-  }, []);
-
   const createDashboard = async (event: React.FormEvent) => {
     event.preventDefault();
     const trimmed = name.trim();
@@ -363,8 +405,10 @@ export default function DashboardManager() {
   };
 
   const moveDashboard = async (folderId: string | null) => {
-    if (!movingDashboard) return;
+    if (!movingDashboard || moving) return;
     try {
+      setMoving(true);
+      setMoveError("");
       await readResponse(
         await fetch(withTenantId(`/api/proxy/api/dashboards/${movingDashboard.id}`, movingDashboard.tenantId), {
           method: "PUT",
@@ -374,8 +418,13 @@ export default function DashboardManager() {
       );
       setMovingDashboard(null);
       void loadDashboards();
+      void loadFolders();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Unable to move dashboard");
+      setMoveError(
+        err instanceof Error ? err.message : "Unable to move dashboard",
+      );
+    } finally {
+      setMoving(false);
     }
   };
 
@@ -488,7 +537,6 @@ export default function DashboardManager() {
           body: JSON.stringify({ name }),
         }),
       );
-      setFolderMenu(null);
       void loadFolders();
     } catch (err) {
       setError(err instanceof Error ? err.message : "Unable to rename folder");
@@ -507,7 +555,6 @@ export default function DashboardManager() {
           method: "DELETE",
         }),
       );
-      setFolderMenu(null);
       if (selectedFolderId === folder.id) setSelectedFolderId("");
       void loadFolders();
       void loadDashboards();
@@ -523,7 +570,6 @@ export default function DashboardManager() {
           method,
         }),
       );
-      setFolderMenu(null);
       void loadFolders();
     } catch (err) {
       setError(
@@ -704,8 +750,6 @@ export default function DashboardManager() {
                 <DashboardFolderTable
                   folders={folders}
                   isSuperAdmin={isSuperAdmin}
-                  folderMenu={folderMenu}
-                  onMenuChange={setFolderMenu}
                   canEdit={canEdit}
                   canDelete={canDelete}
                   onOpen={(folder) => {
@@ -817,115 +861,112 @@ export default function DashboardManager() {
                               <td className="px-4 py-4 text-muted-foreground">
                                 {dashboard.isSubscribed ? "Yes" : "No"}
                               </td>
-                              <td className="relative px-3 py-4">
-                                <Button
-                                  variant="ghost"
-                                  size="icon"
-                                  onClick={(event) => {
-                                    event.stopPropagation();
-                                    setMenu(
-                                      menu === dashboard.id
-                                        ? null
-                                        : dashboard.id,
-                                    );
-                                  }}
-                                >
-                                  <MoreHorizontal className="h-4 w-4" />
-                                </Button>
-                                {menu === dashboard.id && (
-                                  <div
-                                    onClick={(event) => event.stopPropagation()}
-                                    className="absolute right-3 top-12 z-20 w-44 rounded-md border bg-background p-1 shadow-lg"
-                                  >
-                                    <Link
-                                      href={`/dashboards/${dashboard.id}?mode=view&tenantId=${encodeURIComponent(dashboard.tenantId)}`}
-                                      className="flex items-center gap-2 rounded px-3 py-2 text-sm hover:bg-muted"
+                              <td className="px-3 py-4">
+                                <DropdownMenu>
+                                  <DropdownMenuTrigger asChild>
+                                    <Button
+                                      variant="ghost"
+                                      size="icon"
+                                      aria-label={`Actions for ${dashboard.name}`}
                                     >
-                                      View
-                                    </Link>
-                                    {canEdit && (
+                                      <MoreHorizontal className="h-4 w-4" />
+                                    </Button>
+                                  </DropdownMenuTrigger>
+                                  <DropdownMenuContent
+                                    align="end"
+                                    side="bottom"
+                                    collisionPadding={8}
+                                    className="w-48"
+                                  >
+                                    <DropdownMenuItem asChild>
                                       <Link
-                                        href={`/dashboards/${dashboard.id}?mode=edit&tenantId=${encodeURIComponent(dashboard.tenantId)}`}
-                                        className="flex items-center gap-2 rounded px-3 py-2 text-sm hover:bg-muted"
+                                        href={`/dashboards/${dashboard.id}?mode=view&tenantId=${encodeURIComponent(dashboard.tenantId)}`}
                                       >
-                                        Edit
+                                        View
                                       </Link>
+                                    </DropdownMenuItem>
+                                    {canEdit && (
+                                      <DropdownMenuItem asChild>
+                                        <Link
+                                          href={`/dashboards/${dashboard.id}?mode=edit&tenantId=${encodeURIComponent(dashboard.tenantId)}`}
+                                        >
+                                          Edit
+                                        </Link>
+                                      </DropdownMenuItem>
                                     )}
-                                    <button
-                                      onClick={() =>
+                                    <DropdownMenuItem
+                                      onSelect={() =>
                                         void toggleDashboardAction(
                                           dashboard,
                                           "subscribe",
                                         )
                                       }
-                                      className="flex w-full items-center gap-2 rounded px-3 py-2 text-left text-sm hover:bg-muted"
                                     >
                                       {dashboard.isSubscribed
                                         ? "Unsubscribe"
                                         : "Subscribe"}
-                                    </button>
+                                    </DropdownMenuItem>
                                     {canDelete && (
-                                      <button
-                                        onClick={() =>
+                                      <DropdownMenuItem
+                                        className="text-destructive focus:text-destructive"
+                                        onSelect={() =>
                                           void deleteDashboard(dashboard)
                                         }
-                                        className="flex w-full items-center gap-2 rounded px-3 py-2 text-left text-sm text-destructive hover:bg-destructive/10"
                                       >
                                         Delete
-                                      </button>
+                                      </DropdownMenuItem>
                                     )}
-                                    <button
-                                      onClick={() =>
+                                    <DropdownMenuItem
+                                      onSelect={() =>
                                         void toggleDashboardAction(
                                           dashboard,
                                           "favorite",
                                         )
                                       }
-                                      className="flex w-full items-center gap-2 rounded px-3 py-2 text-left text-sm hover:bg-muted"
                                     >
                                       {dashboard.isFavorite
                                         ? "Remove from Favorites"
                                         : "Favorite"}
-                                    </button>
+                                    </DropdownMenuItem>
                                     {canEdit && (
-                                      <button
-                                        onClick={() => {
+                                      <DropdownMenuItem
+                                        onSelect={() => {
                                           setShareDashboard(dashboard);
                                           setShareUserId("");
-                                          setMenu(null);
                                         }}
-                                        className="flex w-full items-center gap-2 rounded px-3 py-2 text-left text-sm hover:bg-muted"
                                       >
                                         Share
-                                      </button>
+                                      </DropdownMenuItem>
                                     )}
                                     {canEdit && (
-                                      <button
-                                        onClick={() => {
+                                      <DropdownMenuItem
+                                        onSelect={() => {
                                           setOwnerDashboard(dashboard);
                                           setOwnerUserId("");
                                           setOwnerSearch("");
-                                          setMenu(null);
                                           void loadOwnerUsers();
                                         }}
-                                        className="flex w-full items-center gap-2 rounded px-3 py-2 text-left text-sm hover:bg-muted"
                                       >
                                         Change Owner
-                                      </button>
+                                      </DropdownMenuItem>
                                     )}
                                     {canEdit && (
-                                      <button
-                                        onClick={() => {
+                                      <DropdownMenuItem
+                                        onSelect={() => {
+                                          setMoveFolderSearch("");
+                                          setMoveFolders([]);
+                                          setMoveError("");
+                                          setSelectedMoveFolderId(
+                                            dashboard.folder?.id || "",
+                                          );
                                           setMovingDashboard(dashboard);
-                                          setMenu(null);
                                         }}
-                                        className="flex w-full items-center gap-2 rounded px-3 py-2 text-left text-sm hover:bg-muted"
                                       >
                                         Move
-                                      </button>
+                                      </DropdownMenuItem>
                                     )}
-                                  </div>
-                                )}
+                                  </DropdownMenuContent>
+                                </DropdownMenu>
                               </td>
                             </tr>
                           ))
@@ -1108,38 +1149,88 @@ export default function DashboardManager() {
       )}
       {movingDashboard && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
-          <div className="w-full max-w-md rounded-lg border bg-background p-6 shadow-xl">
-            <div className="mb-5 flex items-center justify-between">
+          <div className="flex max-h-[calc(100vh-2rem)] w-full max-w-md flex-col overflow-hidden rounded-lg border bg-background p-6 shadow-xl">
+            <div className="mb-4 flex shrink-0 items-center justify-between">
               <h2 className="text-lg font-semibold">Move Dashboard</h2>
-              <button type="button" onClick={() => setMovingDashboard(null)}>
+              <button
+                type="button"
+                aria-label="Close move dashboard dialog"
+                disabled={moving}
+                onClick={() => setMovingDashboard(null)}
+              >
                 <X className="h-5 w-5 text-muted-foreground" />
               </button>
             </div>
-            <div className="space-y-2">
+            <p className="mb-3 shrink-0 text-sm text-muted-foreground">
+              Choose a folder for <span className="font-medium text-foreground">{movingDashboard.name}</span>.
+            </p>
+            <label className="relative mb-3 block shrink-0">
+              <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+              <input
+                type="search"
+                value={moveFolderSearch}
+                onChange={(event) => setMoveFolderSearch(event.target.value)}
+                placeholder="Search folders..."
+                aria-label="Search dashboard folders"
+                className="h-10 w-full rounded-md border bg-background pl-9 pr-3 text-sm outline-none focus:border-primary focus:ring-2 focus:ring-primary/20"
+              />
+            </label>
+            {moveError && (
+              <p role="alert" className="mb-3 shrink-0 rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-sm text-destructive">
+                {moveError}
+              </p>
+            )}
+            <div className="min-h-0 flex-1 space-y-2 overflow-y-auto overscroll-contain pr-1">
               <button
                 type="button"
-                className="flex w-full items-center gap-3 rounded-md border p-3 text-left text-sm hover:bg-muted"
-                onClick={() => void moveDashboard(null)}
+                disabled={moving}
+                aria-pressed={!selectedMoveFolderId}
+                className={`flex w-full items-center gap-3 rounded-md border p-3 text-left text-sm hover:bg-muted disabled:opacity-50 ${!selectedMoveFolderId ? "border-primary bg-primary/5" : ""}`}
+                onClick={() => setSelectedMoveFolderId("")}
               >
                 <Folder className="h-4 w-4" /> No Folder
               </button>
-              {folders.filter((folder) => folder.tenantId === movingDashboard.tenantId).map((folder) => (
+              {moveFoldersLoading ? (
+                <div role="status" className="flex items-center justify-center gap-2 py-8 text-sm text-muted-foreground">
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                  Searching folders...
+                </div>
+              ) : moveFolders.length === 0 ? (
+                <p className="py-8 text-center text-sm text-muted-foreground">
+                  {moveFolderSearch.trim() ? "No folders match your search." : "No available folders."}
+                </p>
+              ) : moveFolders.map((folder) => (
                 <button
                   key={folder.id}
                   type="button"
-                  className="flex w-full items-center gap-3 rounded-md border p-3 text-left text-sm hover:bg-muted"
-                  onClick={() => void moveDashboard(folder.id)}
+                  disabled={moving}
+                  aria-pressed={selectedMoveFolderId === folder.id}
+                  className={`flex w-full items-center justify-between gap-3 rounded-md border p-3 text-left text-sm hover:bg-muted disabled:opacity-50 ${selectedMoveFolderId === folder.id ? "border-primary bg-primary/5" : ""}`}
+                  onClick={() => setSelectedMoveFolderId(folder.id)}
                 >
-                  <Folder className="h-4 w-4" /> {folder.name}
+                  <span className="flex min-w-0 items-center gap-3">
+                    <FolderOpen className="h-4 w-4 shrink-0 text-primary" />
+                    <span className="truncate">{folder.name}</span>
+                  </span>
+                  <span className="shrink-0 text-xs text-muted-foreground">
+                    {folder._count?.dashboards || 0} dashboards
+                  </span>
                 </button>
               ))}
             </div>
-            <div className="mt-5 flex justify-end">
+            <div className="mt-4 flex shrink-0 justify-end gap-2 border-t pt-4">
               <Button
                 variant="outline"
+                disabled={moving}
                 onClick={() => setMovingDashboard(null)}
               >
                 Cancel
+              </Button>
+              <Button
+                disabled={moving}
+                onClick={() => void moveDashboard(selectedMoveFolderId || null)}
+              >
+                {moving ? "Saving..." : "Save"}
               </Button>
             </div>
           </div>
@@ -1244,8 +1335,6 @@ export default function DashboardManager() {
 function DashboardFolderTable({
   folders,
   isSuperAdmin,
-  folderMenu,
-  onMenuChange,
   onOpen,
   onRename,
   onDelete,
@@ -1255,8 +1344,6 @@ function DashboardFolderTable({
 }: {
   folders: FolderItem[];
   isSuperAdmin: boolean;
-  folderMenu: string | null;
-  onMenuChange: (id: string | null) => void;
   onOpen: (folder: FolderItem) => void;
   onRename: (folder: FolderItem) => void;
   onDelete: (folder: FolderItem) => void;
@@ -1323,59 +1410,46 @@ function DashboardFolderTable({
                 <td className="px-4 py-4 text-muted-foreground">
                   {formatFolderDate(folder.updatedAt || folder.createdAt)}
                 </td>
-                <td className="relative px-3 py-4">
-                  <Button
-                    variant="ghost"
-                    size="icon"
-                    aria-label={`Actions for ${folder.name}`}
-                    onClick={(event) => {
-                      event.stopPropagation();
-                      onMenuChange(folderMenu === folder.id ? null : folder.id);
-                    }}
-                  >
-                    <MoreHorizontal className="h-4 w-4" />
-                  </Button>
-                  {folderMenu === folder.id && (
-                    <div
-                      onClick={(event) => event.stopPropagation()}
-                      className="absolute right-3 top-12 z-20 w-48 rounded-md border bg-background p-1 shadow-lg"
+                <td className="px-3 py-4">
+                  <DropdownMenu>
+                    <DropdownMenuTrigger asChild>
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        aria-label={`Actions for ${folder.name}`}
+                      >
+                        <MoreHorizontal className="h-4 w-4" />
+                      </Button>
+                    </DropdownMenuTrigger>
+                    <DropdownMenuContent
+                      align="end"
+                      side="bottom"
+                      collisionPadding={8}
+                      className="w-48"
                     >
-                      <button
-                        type="button"
-                        onClick={() => onOpen(folder)}
-                        className="block w-full rounded px-3 py-2 text-left text-sm hover:bg-muted"
-                      >
+                      <DropdownMenuItem onSelect={() => onOpen(folder)}>
                         Open dashboards
-                      </button>
+                      </DropdownMenuItem>
                       {canEdit && (
-                        <button
-                          type="button"
-                          onClick={() => onRename(folder)}
-                          className="block w-full rounded px-3 py-2 text-left text-sm hover:bg-muted"
-                        >
+                        <DropdownMenuItem onSelect={() => onRename(folder)}>
                           Rename
-                        </button>
+                        </DropdownMenuItem>
                       )}
-                      <button
-                        type="button"
-                        onClick={() => onFavorite(folder)}
-                        className="block w-full rounded px-3 py-2 text-left text-sm hover:bg-muted"
-                      >
+                      <DropdownMenuItem onSelect={() => onFavorite(folder)}>
                         {folder.isFavorite
                           ? "Remove from Favorites"
                           : "Add to Favorites"}
-                      </button>
+                      </DropdownMenuItem>
                       {canDelete && (
-                        <button
-                          type="button"
-                          onClick={() => onDelete(folder)}
-                          className="block w-full rounded px-3 py-2 text-left text-sm text-destructive hover:bg-destructive/10"
+                        <DropdownMenuItem
+                          className="text-destructive focus:text-destructive"
+                          onSelect={() => onDelete(folder)}
                         >
                           Delete
-                        </button>
+                        </DropdownMenuItem>
                       )}
-                    </div>
-                  )}
+                    </DropdownMenuContent>
+                  </DropdownMenu>
                 </td>
               </tr>
             ))

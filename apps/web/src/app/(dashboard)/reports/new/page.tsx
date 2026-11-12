@@ -846,7 +846,52 @@ export default function NewReportPage() {
       return next;
     });
   };
-  const moveColumn = (field: string, direction: -1 | 1) => moveGroup(selectedFields, setSelectedFields, field, direction);
+  const reorderSelectedColumn = (field: string, targetIndex: number) => {
+    setSelectedFields((current) => {
+      const sourceIndex = current.indexOf(field);
+      if (sourceIndex < 0) return current;
+
+      const next = [...current];
+      next.splice(sourceIndex, 1);
+      const insertionIndex = Math.max(
+        0,
+        Math.min(targetIndex - (sourceIndex < targetIndex ? 1 : 0), next.length),
+      );
+      next.splice(insertionIndex, 0, field);
+      return next.every((item, index) => item === current[index]) ? current : next;
+    });
+  };
+  const addColumnAt = (field: string, index: number) => {
+    if (selectedFields.includes(field)) {
+      reorderSelectedColumn(field, index);
+      return;
+    }
+
+    setRowGroups((current) => current.filter((item) => item !== field));
+    setColumnGroups((current) => current.filter((item) => item !== field));
+    if (groupBy === field) setGroupBy("");
+    if (groupColumn === field) setGroupColumn("");
+    setSelectedFields((current) => {
+      if (current.includes(field)) return current;
+      const next = [...current];
+      next.splice(Math.max(0, Math.min(index, next.length)), 0, field);
+      return next;
+    });
+  };
+  const handleColumnDrop = (
+    event: React.DragEvent,
+    targetIndex: number,
+  ) => {
+    event.preventDefault();
+    event.stopPropagation();
+    const field = event.dataTransfer.getData("application/x-report-column");
+    if (!field) return;
+    if (event.dataTransfer.getData("report-column-mode") === "add") {
+      addColumnAt(field, targetIndex);
+    } else {
+      reorderSelectedColumn(field, targetIndex);
+    }
+  };
   const removeRowGroup = (field: string) => {
     const nextRowGroups = rowGroups.filter((item) => item !== field);
     setRowGroups(nextRowGroups);
@@ -1574,33 +1619,70 @@ export default function NewReportPage() {
                         onDragStart={(event) => {
                           event.dataTransfer.setData("text/plain", field.key);
                           event.dataTransfer.setData("group-axis", "fields");
+                          event.dataTransfer.setData("application/x-report-column", field.key);
+                          event.dataTransfer.setData("report-column-mode", "add");
+                          event.dataTransfer.effectAllowed = "copy";
                         }}
                         onClick={() => {
                           toggleField(field.key);
                           setFieldSearch("");
                           setColumnPickerOpen(false);
                         }}
-                        className="flex w-full items-center justify-between rounded px-2 py-1.5 text-left text-xs hover:bg-primary/10"
+                        className="flex w-full cursor-grab items-center justify-between rounded px-2 py-1.5 text-left text-xs hover:bg-primary/10 active:cursor-grabbing"
                       >
                         <span>{field.label}</span>
+                        <GripVertical className="h-3.5 w-3.5 text-slate-400" aria-hidden="true" />
                       </button>
                     ))}
                   </div>
                   )}
                 </div>
-                {selectedFields.map((key) => (
-                  <div key={key} className="mb-2 rounded-lg border border-transparent bg-slate-100 px-3 py-2 text-sm text-[#5c211d]">
-                    <div className="flex items-center justify-between gap-1">
+                <div
+                  onDragOver={(event) => {
+                    if (Array.from(event.dataTransfer.types).includes("application/x-report-column")) {
+                      event.preventDefault();
+                    }
+                  }}
+                  onDrop={(event) => handleColumnDrop(event, selectedFields.length)}
+                  className="min-h-10"
+                >
+                  {selectedFields.map((key, index) => (
+                    <div
+                      key={key}
+                      draggable
+                      onDragStart={(event) => {
+                        event.dataTransfer.setData("application/x-report-column", key);
+                        event.dataTransfer.setData("report-column-mode", "reorder");
+                        event.dataTransfer.effectAllowed = "move";
+                      }}
+                      onDragOver={(event) => {
+                        if (Array.from(event.dataTransfer.types).includes("application/x-report-column")) {
+                          event.preventDefault();
+                        }
+                      }}
+                      onDrop={(event) => {
+                        const bounds = event.currentTarget.getBoundingClientRect();
+                        const insertAfter = event.clientY > bounds.top + bounds.height / 2;
+                        handleColumnDrop(event, index + (insertAfter ? 1 : 0));
+                      }}
+                      className="group mb-2 flex cursor-grab items-center justify-between gap-2 rounded-lg border border-transparent bg-slate-100 px-3 py-2 text-sm text-[#5c211d] transition-colors hover:bg-slate-200 active:cursor-grabbing"
+                    >
+                      <GripVertical className="h-4 w-4 shrink-0 text-slate-400" aria-hidden="true" />
                       <span className="min-w-0 flex-1 truncate text-sm font-medium">{columnLabel(key)}</span>
                       <button type="button" onClick={() => toggleField(key)} aria-label={`Remove ${fieldLabel(key)}`}><X className="h-3.5 w-3.5" /></button>
                     </div>
-                  </div>
-                ))}
-                {selectedFields.length === 0 && !fieldSearch && (
-                  <p className="rounded-md border border-dashed p-3 text-xs text-muted-foreground">
-                    Add columns from the search above.
-                  </p>
-                )}
+                  ))}
+                  {selectedFields.length === 0 && (
+                    <p className="rounded-md border border-dashed p-3 text-xs text-muted-foreground">
+                      Drag fields here or add columns from the search above.
+                    </p>
+                  )}
+                  {selectedFields.length > 0 && (
+                    <p className="px-1 pt-1 text-[11px] text-muted-foreground">
+                      Drag fields here to add them, or drag columns to reorder.
+                    </p>
+                  )}
+                </div>
               </section>
             </div>
           ) : (

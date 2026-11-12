@@ -14,9 +14,9 @@ import {
   getUserObjectPermissions,
   getUserFieldPermissions,
   getObjectDefinition,
-  getRoleHierarchyUserIds,
 } from '../services/metadata';
 import { followUpAccessWhere } from '../services/followUpAccess';
+import { applyScope, getReportRecordAccessClause } from '../services/recordAccess';
 
 const router = Router();
 router.use(authenticate);
@@ -55,36 +55,41 @@ async function getCompaniesApiRelatedData(
     checkObjectPermission(req, 'FollowUp', 'read'),
     checkObjectPermission(req, 'SiteVisit', 'read'),
   ]);
-  const canReadAll = (access: Awaited<ReturnType<typeof checkObjectPermission>>) =>
-    access.allowed && (
-      req.user?.isSuperAdmin ||
-      !access.permissions ||
-      access.permissions.viewAll ||
-      access.permissions.modifyAll
-    );
-  const canReadCompany = canReadAll(companyAccess);
-  const canReadLeads = canReadAll(leadAccess);
-  const canReadCalls = canReadAll(callAccess);
-  const canReadFollowUps = canReadAll(followUpAccess);
-  const canReadSiteVisits = canReadAll(siteVisitAccess);
+  const canReadCompany = companyAccess.allowed;
+  const canReadLeads = leadAccess.allowed;
+  const canReadCalls = callAccess.allowed;
+  const canReadFollowUps = followUpAccess.allowed;
+  const canReadSiteVisits = siteVisitAccess.allowed;
+  const leadWhere = applyScope(
+    { tenantId },
+    await getReportRecordAccessClause(req.user!, 'Lead'),
+  );
+  const callWhere = applyScope(
+    { tenantId },
+    await getReportRecordAccessClause(req.user!, 'CallDetail'),
+  );
+  const siteVisitWhere = applyScope(
+    { tenantId },
+    await getReportRecordAccessClause(req.user!, 'SiteVisit'),
+  );
   const [leads, leadCount, calls, callCount, followUps, followUpCount, siteVisits, siteVisitCount] =
     await Promise.all([
       canReadLeads ? prisma.lead.findMany({
-        where: { tenantId },
+        where: leadWhere,
         select: { id: true, leadNumber: true, firstName: true, lastName: true, email: true, phone: true, status: true, createdAt: true },
         orderBy: { createdAt: 'desc' },
         skip,
         take: limit,
       }) : Promise.resolve([]),
-      canReadLeads ? prisma.lead.count({ where: { tenantId } }) : Promise.resolve(0),
+      canReadLeads ? prisma.lead.count({ where: leadWhere }) : Promise.resolve(0),
       canReadCalls ? prisma.callDetail.findMany({
-        where: { tenantId },
+        where: callWhere,
         select: { id: true, name: true, callId: true, leadId: true, callType: true, callFrom: true, callTo: true, startAt: true, endAt: true, duration: true, status: true, notes: true, createdAt: true },
         orderBy: { createdAt: 'desc' },
         skip,
         take: limit,
       }) : Promise.resolve([]),
-      canReadCalls ? prisma.callDetail.count({ where: { tenantId } }) : Promise.resolve(0),
+      canReadCalls ? prisma.callDetail.count({ where: callWhere }) : Promise.resolve(0),
       canReadFollowUps ? prisma.followUp.findMany({
         where: followUpAccessWhere(req.user!, tenantId),
         select: { id: true, followUpNumber: true, title: true, description: true, dueDate: true, completedAt: true, isCompleted: true, isMissed: true, leadId: true, createdAt: true },
@@ -94,13 +99,13 @@ async function getCompaniesApiRelatedData(
       }) : Promise.resolve([]),
       canReadFollowUps ? prisma.followUp.count({ where: followUpAccessWhere(req.user!, tenantId) }) : Promise.resolve(0),
       canReadSiteVisits ? prisma.siteVisit.findMany({
-        where: { tenantId },
+        where: siteVisitWhere,
         select: { id: true, siteVisitNumber: true, leadId: true, scheduledAt: true, completedAt: true, status: true, feedback: true, rating: true, notes: true, createdAt: true },
         orderBy: { createdAt: 'desc' },
         skip,
         take: limit,
       }) : Promise.resolve([]),
-      canReadSiteVisits ? prisma.siteVisit.count({ where: { tenantId } }) : Promise.resolve(0),
+      canReadSiteVisits ? prisma.siteVisit.count({ where: siteVisitWhere }) : Promise.resolve(0),
     ]);
 
   const paged = <T>(data: T[], total: number) => ({
@@ -141,8 +146,7 @@ async function canAccessOwnedRecord(req: AuthRequest, objectName: string, ownerI
   if (!permissions) return true;
   if (permissions.modifyAll || (permissions.viewAll && action === 'read')) return true;
 
-  const visibleUserIds = await getRoleHierarchyUserIds(req.tenantId!, req.user!.id);
-  return ownerId !== null && visibleUserIds.includes(ownerId);
+  return ownerId === req.user!.id;
 }
 
 async function filterFieldsByPermission(
@@ -191,7 +195,7 @@ router.get('/:objectName', async (req: AuthRequest, res: Response) => {
 
     const ownerIds = req.user?.isSuperAdmin || objectPermissions?.viewAll || objectPermissions?.modifyAll
       ? undefined
-      : await getRoleHierarchyUserIds(req.tenantId!, req.user!.id);
+      : [req.user!.id];
     const result = await listRecords(req.tenantId!, objectName, {
       page: page ? Number(page) : 1,
       limit: limit ? Number(limit) : 20,

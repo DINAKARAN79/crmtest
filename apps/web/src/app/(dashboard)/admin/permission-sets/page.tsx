@@ -103,6 +103,15 @@ interface PermissionSetItem {
   permission: Permission;
 }
 
+interface LeadObjectPermissions {
+  canCreate: boolean;
+  canRead: boolean;
+  canUpdate: boolean;
+  canDelete: boolean;
+  canViewAll: boolean;
+  canEditAll: boolean;
+}
+
 interface UserAssignment {
   id: string;
   userId: string;
@@ -129,6 +138,7 @@ interface PermissionSet {
   description: string;
   isActive: boolean;
   items?: PermissionSetItem[];
+  objectPermissions?: Array<{ object: { name: string }; canViewAll: boolean; canEditAll: boolean }>;
   userAssignments?: UserAssignment[];
   _count?: {
     items: number;
@@ -147,6 +157,12 @@ interface Pagination {
 
 interface PermissionByModule {
   [module: string]: Permission[];
+}
+
+function dateTimeLocalValue(value?: string | null) {
+  if (!value) return "";
+  const date = new Date(value);
+  return new Date(date.getTime() - date.getTimezoneOffset() * 60_000).toISOString().slice(0, 16);
 }
 
 export default function PermissionSetsPage() {
@@ -179,7 +195,16 @@ export default function PermissionSetsPage() {
     name: "",
     description: "",
     isActive: true,
+    expiresAt: "",
     permissionIds: [] as string[],
+  });
+  const [leadPermissions, setLeadPermissions] = useState<LeadObjectPermissions>({
+    canCreate: false,
+    canRead: false,
+    canUpdate: false,
+    canDelete: false,
+    canViewAll: false,
+    canEditAll: false,
   });
 
   const [viewDetails, setViewDetails] = useState<PermissionSet | null>(null);
@@ -240,7 +265,8 @@ export default function PermissionSetsPage() {
   };
 
   const openCreateDialog = () => {
-    setFormData({ name: "", description: "", isActive: true, permissionIds: [] });
+    setFormData({ name: "", description: "", isActive: true, expiresAt: "", permissionIds: [] });
+    setLeadPermissions({ canCreate: false, canRead: false, canUpdate: false, canDelete: false, canViewAll: false, canEditAll: false });
     setCreateDialogOpen(true);
   };
 
@@ -249,20 +275,42 @@ export default function PermissionSetsPage() {
     setFormLoading(true);
     setEditDialogOpen(true);
     try {
-      const response = await newPermissionSetApi.get(ps.id);
+      const [response, leadResponse] = await Promise.all([
+        newPermissionSetApi.get(ps.id),
+        newPermissionSetApi.getObjectPermissions(ps.id, "Lead"),
+      ]);
       const detail = response.data.data;
       setFormData({
         name: detail.name,
         description: detail.description || "",
         isActive: detail.isActive,
+        expiresAt: dateTimeLocalValue(detail.expiresAt),
         permissionIds: (detail.items || []).map((item: PermissionSetItem) => item.permission.id),
       });
+      setLeadPermissions(leadResponse.data.data);
     } catch (error) {
       console.error("Failed to load permission set:", error);
       setEditDialogOpen(false);
     } finally {
       setFormLoading(false);
     }
+  };
+
+  const updateLeadPermission = (key: keyof LeadObjectPermissions, checked: boolean) => {
+    setLeadPermissions((previous) => {
+      const next = { ...previous, [key]: checked };
+      if (key === "canRead" && !checked) {
+        next.canViewAll = false;
+        next.canEditAll = false;
+      }
+      if (key === "canViewAll" && checked) next.canRead = true;
+      if (key === "canEditAll" && checked) {
+        next.canViewAll = true;
+        next.canRead = true;
+        next.canUpdate = true;
+      }
+      return next;
+    });
   };
 
   const openViewDialog = async (ps: PermissionSet) => {
@@ -323,17 +371,19 @@ export default function PermissionSetsPage() {
       toast({ title: "Name required", description: "Enter a permission set name.", variant: "destructive" as any });
       return;
     }
-    if (formData.permissionIds.length === 0) {
+    if (formData.permissionIds.length === 0 && !Object.values(leadPermissions).some(Boolean)) {
       toast({ title: "Permission required", description: "Select at least one permission before creating the set.", variant: "destructive" as any });
       return;
     }
     try {
       setSubmitting(true);
-      await newPermissionSetApi.create({
+      const created = await newPermissionSetApi.create({
         name: formData.name.trim(),
         description: formData.description.trim(),
         permissionIds: formData.permissionIds,
+        expiresAt: formData.expiresAt ? new Date(formData.expiresAt).toISOString() : null,
       });
+      await newPermissionSetApi.updateObjectPermissions(created.data.data.id, "Lead", leadPermissions);
       setCreateDialogOpen(false);
       fetchPermissionSets(pagination.page, searchQuery, statusFilter);
       await refreshAuth();
@@ -350,7 +400,7 @@ export default function PermissionSetsPage() {
       toast({ title: "Name required", description: "Enter a permission set name.", variant: "destructive" as any });
       return;
     }
-    if (formData.permissionIds.length === 0) {
+    if (formData.permissionIds.length === 0 && !Object.values(leadPermissions).some(Boolean)) {
       toast({ title: "Permission required", description: "Select at least one permission before saving the set.", variant: "destructive" as any });
       return;
     }
@@ -361,7 +411,9 @@ export default function PermissionSetsPage() {
         description: formData.description.trim(),
         isActive: formData.isActive,
         permissionIds: formData.permissionIds,
+        expiresAt: formData.expiresAt ? new Date(formData.expiresAt).toISOString() : null,
       });
+      await newPermissionSetApi.updateObjectPermissions(selectedPermissionSet.id, "Lead", leadPermissions);
       setEditDialogOpen(false);
       fetchPermissionSets(pagination.page, searchQuery, statusFilter);
       await refreshAuth();
@@ -455,6 +507,49 @@ export default function PermissionSetsPage() {
     return grouped;
   }, [viewDetails]);
 
+  const renderLeadObjectPermissions = (idPrefix: string) => (
+    <div className="space-y-3 rounded-lg border p-4">
+      <div>
+        <Label className="text-base font-semibold">Lead Object Permissions</Label>
+        <p className="text-sm text-muted-foreground">These permissions control Lead record access.</p>
+      </div>
+      <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
+        {([
+          ["canCreate", "Create"],
+          ["canRead", "Read"],
+          ["canUpdate", "Update"],
+          ["canDelete", "Delete"],
+          ["canViewAll", "View All Leads"],
+          ["canEditAll", "Edit All Leads"],
+        ] as const).map(([key, label]) => {
+          const tooltip = key === "canViewAll"
+            ? "Can see all leads regardless of owner or hierarchy"
+            : key === "canEditAll"
+              ? "Can see and edit all leads regardless of owner or hierarchy"
+              : undefined;
+          return (
+            <div key={key} className="flex items-center gap-2">
+              <Checkbox
+                id={`${idPrefix}-${key}`}
+                title={tooltip}
+                checked={leadPermissions[key]}
+                onCheckedChange={(checked) => updateLeadPermission(key, !!checked)}
+              />
+              <Label htmlFor={`${idPrefix}-${key}`} title={tooltip} className="cursor-pointer text-sm font-normal">
+                {label}
+              </Label>
+            </div>
+          );
+        })}
+      </div>
+      {(leadPermissions.canViewAll || leadPermissions.canEditAll) && (
+        <div className="rounded-md border border-amber-300 bg-amber-50 p-3 text-sm text-amber-900">
+          Users with this permission set will access all leads in the organization.
+        </div>
+      )}
+    </div>
+  );
+
   return (
     <div className="space-y-6">
       <Card>
@@ -525,7 +620,16 @@ export default function PermissionSetsPage() {
                   <TableBody>
                     {permissionSets.map((ps) => (
                       <TableRow key={ps.id}>
-                        <TableCell className="font-medium">{ps.name}</TableCell>
+                        <TableCell className="font-medium">
+                          <div className="flex items-center gap-2">
+                            <span>{ps.name}</span>
+                            {ps.objectPermissions?.some((permission) => permission.object.name.toLowerCase() === "lead" && permission.canEditAll) ? (
+                              <Badge variant="destructive">Edit All Leads</Badge>
+                            ) : ps.objectPermissions?.some((permission) => permission.object.name.toLowerCase() === "lead" && permission.canViewAll) ? (
+                              <Badge variant="secondary">View All Leads</Badge>
+                            ) : null}
+                          </div>
+                        </TableCell>
                         <TableCell className="text-muted-foreground max-w-xs truncate">
                           {ps.description || "No description"}
                         </TableCell>
@@ -643,6 +747,17 @@ export default function PermissionSetsPage() {
                   }
                 />
               </div>
+              <div className="space-y-2">
+                <Label htmlFor="create-expires-at">Expires at (optional)</Label>
+                <Input
+                  id="create-expires-at"
+                  type="datetime-local"
+                  value={formData.expiresAt}
+                  onChange={(e) => setFormData((prev) => ({ ...prev, expiresAt: e.target.value }))}
+                />
+              </div>
+
+              {renderLeadObjectPermissions("create-lead")}
 
               <div className="space-y-3">
                 <Label className="text-base font-semibold">Permission Matrix</Label>
@@ -724,7 +839,7 @@ export default function PermissionSetsPage() {
             </Button>
             <Button
               type="submit"
-              disabled={!formData.name.trim() || formData.permissionIds.length === 0 || submitting}
+              disabled={!formData.name.trim() || (formData.permissionIds.length === 0 && !Object.values(leadPermissions).some(Boolean)) || submitting}
             >
               {submitting ? "Creating..." : "Create Permission Set"}
             </Button>
@@ -770,6 +885,15 @@ export default function PermissionSetsPage() {
                       }
                     />
                   </div>
+                  <div className="space-y-2">
+                    <Label htmlFor="edit-expires-at">Expires at (optional)</Label>
+                    <Input
+                      id="edit-expires-at"
+                      type="datetime-local"
+                      value={formData.expiresAt}
+                      onChange={(e) => setFormData((prev) => ({ ...prev, expiresAt: e.target.value }))}
+                    />
+                  </div>
                   <div className="flex items-center gap-2">
                     <Checkbox
                       id="edit-active"
@@ -782,6 +906,8 @@ export default function PermissionSetsPage() {
                       Active
                     </Label>
                   </div>
+
+                  {renderLeadObjectPermissions("edit-lead")}
 
                   <div className="space-y-3">
                     <Label className="text-base font-semibold">Permission Matrix</Label>
@@ -853,7 +979,7 @@ export default function PermissionSetsPage() {
                 </Button>
                 <Button
                   type="submit"
-                  disabled={!formData.name.trim() || formData.permissionIds.length === 0 || submitting}
+                  disabled={!formData.name.trim() || (formData.permissionIds.length === 0 && !Object.values(leadPermissions).some(Boolean)) || submitting}
                 >
                   {submitting ? "Updating..." : "Update Permission Set"}
                 </Button>

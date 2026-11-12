@@ -3,6 +3,7 @@ import { prisma } from '@dct-crm/db';
 import { z } from 'zod';
 import { authenticate, AuthRequest } from '../middleware/auth';
 import { requirePermission } from '../middleware/permissions';
+import { EffectivePermissionService } from '../services/effectivePermissions';
 
 const router = Router();
 router.use(authenticate);
@@ -204,6 +205,7 @@ router.post('/:userId/permission-sets', requirePermission('PERMISSION_SET_ASSIGN
         data: newIds.map((permissionSetId) => ({ userId: targetUser.id, permissionSetId })),
         skipDuplicates: true,
       });
+      EffectivePermissionService.invalidateUserPermissionsCache([targetUser.id]);
     }
 
     await prisma.auditLog.create({
@@ -263,6 +265,7 @@ router.delete('/:userId/permission-sets/:permissionSetId', requirePermission('PE
     if (deleted.count === 0) {
       return res.status(404).json({ success: false, error: 'Assignment not found' });
     }
+    EffectivePermissionService.invalidateUserPermissionsCache([targetUser.id]);
 
     await prisma.auditLog.create({
       data: {

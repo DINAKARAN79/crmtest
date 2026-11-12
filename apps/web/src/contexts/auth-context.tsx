@@ -30,6 +30,7 @@ export interface UserProfile {
   name: string;
   description?: string;
   isAdmin?: boolean;
+  sidebarAccess?: string[] | null;
 }
 
 export interface UserData {

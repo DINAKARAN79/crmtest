@@ -8,6 +8,7 @@ describe('bootstrapTenant', () => {
   const adminRole = { id: 'admin-role' };
   const seededObjects: Array<{ id: string; label: string; name: string }> = [];
   const tx = {
+    bookedBucketSetting: { upsert: vi.fn().mockResolvedValue({}) },
     permission: {
       createMany: vi.fn().mockResolvedValue({ count: 20 }),
       updateMany: vi.fn().mockResolvedValue({ count: 0 }),
@@ -150,6 +151,8 @@ describe('bootstrapTenant', () => {
       'Activity',
       'CallDetail',
       'User',
+      'RRQueue',
+      'RRQueueMember',
     ]);
     expect(tx.fieldDefinition.updateMany).toHaveBeenCalledWith({
       where: { tenantId: 'new-tenant', objectId: 'object-5' },

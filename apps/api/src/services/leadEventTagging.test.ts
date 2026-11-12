@@ -1,4 +1,5 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
+import type { Prisma } from '@prisma/client';
 import {
   buildLeadEnquiryAttributionUpdates,
   buildLeadFollowUpTagUpdates,
@@ -7,6 +8,7 @@ import {
   FIELD_TAGGING_REGISTRY,
   isConfiguredLostStatus,
   mergeOperationalLeadCustomFields,
+  tagLeadFollowUpEvents,
 } from './leadEventTagging';
 
 describe('Lead event tag mapping', () => {
@@ -74,7 +76,26 @@ describe('Lead event tag mapping', () => {
 
   it('tags reopened Leads and resets only current operational tags', () => {
     const result = buildLeadEnquiryAttributionUpdates(
-      { sf_Custom_Note__c: 'preserve this' },
+      {
+        sf_Custom_Note__c: 'preserve this',
+        sf_First_Source_Of_Enquiry__c: 'Original source',
+        sf_First_Sub_Source__c: 'Original sub-source',
+        sf_First_Approach_On__c: '2026-01-02T00:00:00.000Z',
+        sf_First_Campaign__c: 'Original campaign',
+        sf_Followup_Scheduled__c: true,
+        sf_Abandoned_Date__c: '2026-01-01T00:00:00.000Z',
+        sf_Is_Unqualified__c: true,
+        sf_Unqualified_Date__c: '2026-01-02T00:00:00.000Z',
+        sf_Unqualified_Lost_By__c: 'presales-user-id',
+        sf_Unqualified_Reason__c: 'Not interested',
+        sf_Is_Closed_Lost__c: true,
+        sf_Closed_Lost_Date__c: '2026-01-03T00:00:00.000Z',
+        sf_Closed_Lost_By__c: 'sales-user-id',
+        sf_IsPushed__c: true,
+        sf_Lead_Pull_Requested_By__c: 'requester-id',
+        sf_Pre_sales_user__c: 'presales-user-id',
+        sf_Recovery_User__c: 'recovery-user-id',
+      },
       {
         source: 'Website',
         occurredAt: new Date('2026-10-11T16:00:00.000Z'),
@@ -90,11 +111,35 @@ describe('Lead event tag mapping', () => {
       sf_Lead_Assigned__c: false,
       sf_Lead_Transfered__c: false,
       sf_Assigment_count__c: 0,
-      sf_Next_follow_up_Date__c: null,
       sf_Site_Visit_Schedule_Date__c: null,
       sf_Site_visit_Project__c: null,
+      sf_Site_Visit_Feedback__c: null,
+      sf_Subject__c: null,
+      sf_Last_comment__c: '',
+      sf_status_change_date__c: null,
+      sf_Pre_sales_user__c: null,
+      sf_Recovery_User__c: null,
+      sf_Pushed_On__c: null,
+      sf_Pushed_By__c: null,
+      sf_Abandoned_Date__c: null,
+      sf_Is_Unqualified__c: false,
+      sf_Unqualified_Date__c: null,
+      sf_Unqualified_Lost_By__c: null,
+      sf_Unqualified_Reason__c: null,
+      sf_Is_Closed_Lost__c: false,
+      sf_Closed_Lost_Date__c: null,
+      sf_Closed_Lost_By__c: null,
+      sf_IsPushed__c: false,
+      sf_Lead_Pull_Requested_By__c: null,
+      sf_Type_of_lead__c: 'Direct Lead',
+      sf_First_Source_Of_Enquiry__c: 'Original source',
+      sf_First_Sub_Source__c: 'Original sub-source',
+      sf_First_Approach_On__c: '2026-01-02T00:00:00.000Z',
+      sf_First_Campaign__c: 'Original campaign',
+      sf_Followup_Scheduled__c: true,
       sf_Custom_Note__c: 'preserve this',
     });
+    expect(result).not.toHaveProperty('sf_Next_follow_up_Date__c');
   });
 
   it('matches configured lost status labels exactly', () => {
@@ -155,18 +200,21 @@ describe('Lead event tag mapping', () => {
     });
   });
 
-  it('recalculates follow-up count and the earliest open date without replacing unrelated tags', () => {
+  it('recalculates follow-up count and changes a new lead to Follow Up', () => {
     const result = buildLeadFollowUpTagUpdates(
       { sf_Lead_Status__c: 'New Enquiry', sf_Custom_Note__c: 'keep' },
       [
-        { dueDate: new Date('2026-10-15T09:00:00.000Z'), isCompleted: false },
+        { dueDate: new Date('2026-10-15T09:00:00.000Z'), isCompleted: false, status: 'SCHEDULED' },
         { dueDate: new Date('2026-10-12T09:00:00.000Z'), isCompleted: true },
-        { dueDate: new Date('2026-10-13T09:00:00.000Z'), isCompleted: false },
+        { dueDate: new Date('2026-10-13T09:00:00.000Z'), isCompleted: false, status: 'SCHEDULED' },
       ],
+      undefined,
+      true,
     );
 
     expect(result).toMatchObject({
       sf_Followup_Count__c: 3,
+      sf_Followup_Scheduled__c: true,
       sf_Next_follow_up_Date__c: '2026-10-13T09:00:00.000Z',
       sf_Lead_Status__c: 'Follow Up',
       sf_Custom_Note__c: 'keep',
@@ -181,9 +229,23 @@ describe('Lead event tag mapping', () => {
 
     expect(result).toMatchObject({
       sf_Followup_Count__c: 1,
+      sf_Followup_Scheduled__c: false,
       sf_Next_follow_up_Date__c: null,
       sf_Lead_Status__c: 'Recovery - Sales',
       sf_Custom_Note__c: 'keep',
+    });
+  });
+
+  it('clears the scheduled flag, date, and count when the last FollowUp is deleted', () => {
+    const result = buildLeadFollowUpTagUpdates(
+      { sf_Followup_Count__c: 1, sf_Followup_Scheduled__c: true, sf_Next_follow_up_Date__c: '2026-10-12T09:00:00.000Z' },
+      [],
+    );
+
+    expect(result).toMatchObject({
+      sf_Followup_Count__c: 0,
+      sf_Followup_Scheduled__c: false,
+      sf_Next_follow_up_Date__c: null,
     });
   });
 
@@ -191,12 +253,103 @@ describe('Lead event tag mapping', () => {
     const result = buildLeadFollowUpTagUpdates(
       {},
       [
-        { dueDate: new Date('2026-10-12T09:00:00.000Z'), isCompleted: false, isMissed: true },
-        { dueDate: new Date('2026-10-13T09:00:00.000Z'), isCompleted: false },
+        { dueDate: new Date('2026-10-12T09:00:00.000Z'), isCompleted: false, isMissed: true, status: 'MISSED' },
+        { dueDate: new Date('2026-10-13T09:00:00.000Z'), isCompleted: false, status: 'SCHEDULED' },
       ],
     );
 
+    expect(result.sf_Followup_Scheduled__c).toBe(true);
     expect(result.sf_Next_follow_up_Date__c).toBe('2026-10-13T09:00:00.000Z');
+  });
+
+  it('does not mark system-cancelled or cancelled follow-ups as scheduled', () => {
+    const result = buildLeadFollowUpTagUpdates(
+      {},
+      [
+        {
+          dueDate: new Date('2026-10-12T09:00:00.000Z'),
+          isCompleted: false,
+          isSystemCancelled: true,
+          status: 'SCHEDULED',
+        },
+        {
+          dueDate: new Date('2026-10-13T09:00:00.000Z'),
+          isCompleted: false,
+          status: 'CANCELLED',
+        },
+      ],
+    );
+
+    expect(result).toMatchObject({
+      sf_Followup_Count__c: 2,
+      sf_Followup_Scheduled__c: false,
+      sf_Next_follow_up_Date__c: null,
+    });
+
+  });
+
+  it('updates Salesforce Lead status only when a scheduled follow-up exists', () => {
+    const scheduled = [{
+      dueDate: new Date('2026-10-13T09:00:00.000Z'),
+      isCompleted: false,
+      isMissed: false,
+      status: 'SCHEDULED',
+    }];
+
+    expect(buildLeadFollowUpTagUpdates({ sf_Lead_Status__c: 'New Enquiry' }, scheduled))
+      .toMatchObject({ sf_Lead_Status__c: 'New Enquiry' });
+    expect(buildLeadFollowUpTagUpdates({ sf_Lead_Status__c: 'New Enquiry' }, scheduled, undefined, true))
+      .toMatchObject({ sf_Lead_Status__c: 'Follow Up' });
+    expect(buildLeadFollowUpTagUpdates({ sf_Lead_Status__c: 'Recovery - Sales' }, scheduled))
+      .toMatchObject({ sf_Lead_Status__c: 'Recovery - Sales' });
+    expect(buildLeadFollowUpTagUpdates({ sf_Lead_Status__c: 'Recovery - Sales' }, scheduled, undefined, true))
+      .toMatchObject({ sf_Lead_Status__c: 'Recovery Followup' });
+    expect(buildLeadFollowUpTagUpdates({}, scheduled, 'NEW', true))
+      .toMatchObject({ sf_Lead_Status__c: 'Follow Up' });
+    expect(buildLeadFollowUpTagUpdates({ sf_Lead_Status__c: 'Follow Up' }, []))
+      .toMatchObject({ sf_Lead_Status__c: 'Follow Up' });
+  });
+
+  it('recomputes moved Lead tags together with one database update', async () => {
+    const executeRaw = vi.fn().mockResolvedValue(2);
+    const leadFindMany = vi.fn().mockResolvedValue([
+      { id: 'lead-old', customFields: {} },
+      { id: 'lead-new', customFields: {} },
+    ]);
+    const followUpFindMany = vi.fn().mockResolvedValue([
+      {
+        leadId: 'lead-new',
+        dueDate: new Date('2026-10-13T09:00:00.000Z'),
+        isCompleted: false,
+        isMissed: false,
+        isSystemCancelled: false,
+        status: 'SCHEDULED',
+      },
+    ]);
+    const tx = {
+      $executeRaw: executeRaw,
+      lead: { findMany: leadFindMany },
+      followUp: { findMany: followUpFindMany },
+    } as unknown as Prisma.TransactionClient;
+
+    await tagLeadFollowUpEvents(tx, 'tenant-1', ['lead-old', 'lead-new', 'lead-old']);
+
+    expect(leadFindMany).toHaveBeenCalledWith({
+      where: { id: { in: ['lead-old', 'lead-new'] }, tenantId: 'tenant-1' },
+      select: { id: true, customFields: true, status: true },
+    });
+    expect(followUpFindMany).toHaveBeenCalledWith({
+      where: { tenantId: 'tenant-1', leadId: { in: ['lead-old', 'lead-new'] } },
+      select: {
+        leadId: true,
+        dueDate: true,
+        isCompleted: true,
+        isMissed: true,
+        isSystemCancelled: true,
+        status: true,
+      },
+    });
+    expect(executeRaw).toHaveBeenCalledOnce();
   });
 
   it('tags a scheduled Site Visit and only changes feedback when supplied', () => {

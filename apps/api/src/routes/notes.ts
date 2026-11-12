@@ -3,7 +3,7 @@ import { prisma } from '@dct-crm/db';
 import { z } from 'zod';
 import { authenticate, AuthRequest } from '../middleware/auth';
 import { EffectivePermissionService } from '../services/effectivePermissions';
-import { canAccessLead } from '../services/recordAccess';
+import { canAccessLead, canEditLead } from '../services/recordAccess';
 import { getTenantTimezone } from '../services/tenantTimezone';
 
 const router = Router();
@@ -97,7 +97,7 @@ router.post('/:recordId', async (req: AuthRequest, res: Response) => {
     if (!(await hasNotePermission(req.user!, record, 'UPDATE'))) {
       return res.status(403).json({ success: false, error: `Insufficient permissions for ${record.type}:edit` });
     }
-    if (!(await canAccessNoteRecord(req.user!, record))) {
+    if (!(await canEditLead(req.user!, record))) {
       return res.status(403).json({ success: false, error: 'You do not have access to this record' });
     }
 

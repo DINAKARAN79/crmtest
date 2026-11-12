@@ -34,15 +34,6 @@ export function DashboardValuesWidget({ widget }: { widget: { id: string; descri
         style={{ height }}
         className="w-full border-0 bg-white"
       />
-      <a
-        href={`/dashboard/${encodeURIComponent(dashboardId)}?mode=view`}
-        target="_blank"
-        rel="noreferrer"
-        onPointerDown={(event) => event.stopPropagation()}
-        className="absolute right-2 top-1 rounded bg-white/90 px-2 py-0.5 text-xs font-medium text-blue-600 hover:underline"
-      >
-        Open dashboard
-      </a>
     </div>
   );
 }

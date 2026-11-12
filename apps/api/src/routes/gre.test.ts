@@ -1,8 +1,28 @@
 import { describe, expect, it } from 'vitest';
 import { crmDateRangeBounds, crmLocalDateTimeToDate } from '@dct-crm/shared';
-import { getGreLeadStatus, greDraftSchema, greLocationSchema, greSubmissionSchema, normalizePhone, normalizeStoredPhone, phoneCheckSchema, phoneSearchVariants, selectScheduledVisitToComplete, submissionsQuerySchema } from './gre';
+import { getGreLeadStatus, greDraftSchema, greLocationSchema, greRegistrationLeadType, greSubmissionSchema, hasActiveGreSiteVisit, normalizePhone, normalizeStoredPhone, parseGreSiteVisitDateTime, phoneCheckSchema, phoneSearchVariants, selectScheduledVisitToComplete, shouldCreateGreRelatedSource, submissionsQuerySchema } from './gre';
 
 describe('GRE phone validation and matching', () => {
+  it('does not classify a GRE source as Re-Engaged for an active lead with a scheduled visit', () => {
+    const activeLead = { status: 'SITE_VISIT_SCHEDULED', scheduledSiteVisits: [{ id: 'visit-1' }] };
+
+    expect(hasActiveGreSiteVisit(activeLead)).toBe(true);
+    expect(shouldCreateGreRelatedSource(activeLead)).toBe(false);
+    expect(greRegistrationLeadType(true, undefined, hasActiveGreSiteVisit(activeLead))).toBe('ADDITIONAL');
+    expect(greRegistrationLeadType(true, 'RE_ENGAGED', hasActiveGreSiteVisit(activeLead))).toBe('ADDITIONAL');
+  });
+
+  it('keeps re-engagement for leads without an active scheduled visit, including lost leads', () => {
+    expect(hasActiveGreSiteVisit({ status: 'LOST', scheduledSiteVisits: [{ id: 'visit-1' }] })).toBe(false);
+    expect(shouldCreateGreRelatedSource({ status: 'LOST', scheduledSiteVisits: [{ id: 'visit-1' }] })).toBe(true);
+    expect(shouldCreateGreRelatedSource(null)).toBe(true);
+    expect(greRegistrationLeadType(true)).toBe('RE_ENGAGED');
+    expect(greRegistrationLeadType(true, undefined, hasActiveGreSiteVisit({
+      status: 'LOST',
+      scheduledSiteVisits: [{ id: 'visit-1' }],
+    }))).toBe('RE_ENGAGED');
+  });
+
   it('selects the scheduled Site Visit closest to the GRE completion time', () => {
     const target = new Date('2026-10-07T14:20:00.000Z');
     const visits = [
@@ -14,12 +34,17 @@ describe('GRE phone validation and matching', () => {
     expect(selectScheduledVisitToComplete([], target)).toBeNull();
   });
 
-  it('preserves existing configured Lead Status without inventing a GRE transition', () => {
-    expect(getGreLeadStatus(true)).toBe('NEW');
+  it('moves an existing Lead to Site Visit Happened when GRE completes a visit', () => {
+    expect(getGreLeadStatus(true)).toBe('SITE_VISIT_HAPPENED');
     expect(getGreLeadStatus(false)).toBe('NEW');
     expect(getGreLeadStatus(false, 'PROSPECT')).toBe('PROSPECT');
-    expect(getGreLeadStatus(true, 'INCOMING')).toBe('INCOMING');
+    expect(getGreLeadStatus(true, 'NEW')).toBe('SITE_VISIT_HAPPENED');
+    expect(getGreLeadStatus(true, 'INCOMING')).toBe('SITE_VISIT_HAPPENED');
+    expect(getGreLeadStatus(true, 'PROSPECT')).toBe('SITE_VISIT_HAPPENED');
+    expect(getGreLeadStatus(true, 'SITE_VISIT_SCHEDULED')).toBe('SITE_VISIT_HAPPENED');
+    expect(getGreLeadStatus(false, 'SITE_VISIT_SCHEDULED')).toBe('SITE_VISIT_SCHEDULED');
     expect(getGreLeadStatus(true, 'LOST')).toBe('LOST');
+    expect(getGreLeadStatus(true, 'BOOKED')).toBe('BOOKED');
   });
 
   it('converts and filters tenant-local calendar dates while keeping UTC timestamps', () => {
@@ -30,6 +55,15 @@ describe('GRE phone validation and matching', () => {
       gte: new Date('2026-07-01T04:00:00.000Z'),
       lt: new Date('2026-07-02T04:00:00.000Z'),
     });
+
+  });
+
+  it('validates GRE visit date/time against the tenant-local current minute', () => {
+    const now = new Date('2026-11-12T06:11:45.000Z');
+    expect(parseGreSiteVisitDateTime('2026-11-12', '11:41', 'Asia/Kolkata', now)?.toISOString())
+      .toBe('2026-11-12T06:11:00.000Z');
+    expect(parseGreSiteVisitDateTime('2026-11-12', '11:42', 'Asia/Kolkata', now)).toBeNull();
+    expect(parseGreSiteVisitDateTime('2026-02-30', '10:00', 'Asia/Kolkata', now)).toBeNull();
   });
 
   it('accepts national phone input with a separate country code', () => {

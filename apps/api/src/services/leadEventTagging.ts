@@ -1,7 +1,8 @@
-import type { Prisma } from '@prisma/client';
+import { Prisma } from '@prisma/client';
+import type { Prisma as PrismaTypes } from '@prisma/client';
 import type { JsonValue } from '@dct-crm/shared';
 
-type Db = Prisma.TransactionClient;
+type Db = PrismaTypes.TransactionClient;
 
 export const LOST_STATUSES = [
   'Abandoned',
@@ -734,24 +735,38 @@ export function updateSalesforceCustomFields(
 
 export function buildLeadFollowUpTagUpdates(
   current: Prisma.JsonValue | null | undefined,
-  followUps: Array<{ dueDate: Date; isCompleted: boolean; isMissed?: boolean }>,
+  followUps: Array<{
+    dueDate: Date;
+    isCompleted: boolean;
+    isMissed?: boolean;
+    isSystemCancelled?: boolean;
+    status?: string | null;
+  }>,
+  leadStatus?: string,
+  transitionToScheduled = false,
 ): Prisma.InputJsonObject {
   const scheduled = followUps
-    .filter((followUp) => !followUp.isCompleted && !followUp.isMissed)
+    .filter((followUp) => (
+      !followUp.isCompleted
+      && !followUp.isMissed
+      && !followUp.isSystemCancelled
+      && (followUp.status == null || followUp.status === 'SCHEDULED')
+    ))
     .sort((left, right) => left.dueDate.getTime() - right.dueDate.getTime());
-  const leadTags = asCustomFieldObject(current);
-  const updates: Record<string, unknown> = {
+  const customStatus = asCustomFieldObject(current).sf_Lead_Status__c;
+  const nextStatus = transitionToScheduled && scheduled.length > 0
+    ? customStatus === 'Recovery - Pre Sales' || customStatus === 'Recovery - Sales'
+      ? 'Recovery Followup'
+      : customStatus === 'New Enquiry' || (!customStatus && ['NEW', 'INCOMING'].includes(leadStatus || ''))
+        ? 'Follow Up'
+        : undefined
+    : undefined;
+  return updateSalesforceCustomFields(current, {
     Followup_Count__c: followUps.length,
+    Followup_Scheduled__c: scheduled.length > 0,
     Next_follow_up_Date__c: scheduled[0]?.dueDate.toISOString() ?? null,
-  };
-  if (scheduled.length > 0) {
-    const currentStatus = leadTags.sf_Lead_Status__c;
-    if (currentStatus === 'New Enquiry') updates.Lead_Status__c = 'Follow Up';
-    if (currentStatus === 'Recovery - Pre Sales' || currentStatus === 'Recovery - Sales') {
-      updates.Lead_Status__c = 'Recovery Followup';
-    }
-  }
-  return updateSalesforceCustomFields(current, updates);
+    ...(nextStatus ? { Lead_Status__c: nextStatus } : {}),
+  });
 }
 
 export function buildLeadSiteVisitTagUpdates(
@@ -794,6 +809,7 @@ export function buildLeadEnquiryAttributionUpdates(
     secondaryCountryCode?: string;
     tertiaryPhone?: string;
     secondaryEmail?: string;
+    channelPartner?: string;
     occurredAt: Date;
     lifecycleType?: 'Fresh' | 'Re-Engaged' | 'Re-Opened';
     isLeadCreation?: boolean;
@@ -825,6 +841,7 @@ export function buildLeadEnquiryAttributionUpdates(
   if (params.campaignId) updates.Campaign__c = params.campaignId;
   if (params.subCampaignId) updates.Sub_Campaign_ID__c = params.subCampaignId;
   if (params.projectName) updates.Allocated_Project__c = params.projectName;
+  if (params.channelPartner) updates.Channel_Partner__c = params.channelPartner;
   if (params.isLeadCreation) {
     if (params.countryCode) updates.Country_Code__c = params.countryCode;
     if (params.country) updates.Country__c = params.country;
@@ -852,14 +869,32 @@ export function buildLeadEnquiryAttributionUpdates(
     updates.pre_sales_last_contacted__c = null;
     updates.sales_last_attempt__c = null;
     updates.sales_last_contacted__c = null;
-    updates.Next_follow_up_Date__c = null;
+    updates.status_change_date__c = null;
+    updates.Last_comment__c = '';
     updates.Site_Visit_Schedule_Date__c = null;
     updates.Site_visit_Project__c = null;
+    updates.Site_Visit_Feedback__c = null;
     updates.Next_Site_visit_Date__c = null;
+    updates.Subject__c = null;
     updates.Closed_Lost_Reason__c = null;
     updates.Remark_for_Closed_Lost__c = null;
     updates.Re_assigned_date__c = null;
     updates.RNR_date__c = null;
+    updates.Pre_sales_user__c = null;
+    updates.Recovery_User__c = null;
+    updates.Pushed_On__c = null;
+    updates.Pushed_By__c = null;
+    updates.Abandoned_Date__c = null;
+    updates.Is_Unqualified__c = false;
+    updates.Unqualified_Date__c = null;
+    updates.Unqualified_Lost_By__c = null;
+    updates.Unqualified_Reason__c = null;
+    updates.Is_Closed_Lost__c = false;
+    updates.Closed_Lost_Date__c = null;
+    updates.Closed_Lost_By__c = null;
+    updates.IsPushed__c = false;
+    updates.Lead_Pull_Requested_By__c = null;
+    updates.Type_of_lead__c = 'Direct Lead';
   }
 
   return updateSalesforceCustomFields(current, updates);
@@ -882,6 +917,7 @@ export async function tagLeadEnquiryAttribution(
     secondaryCountryCode?: string;
     tertiaryPhone?: string;
     secondaryEmail?: string;
+    channelPartner?: string;
     occurredAt: Date;
     lifecycleType?: 'Fresh' | 'Re-Engaged' | 'Re-Opened';
     isLeadCreation?: boolean;
@@ -917,25 +953,63 @@ export async function tagLeadEnquiryAttribution(
 export async function tagLeadFollowUpEvents(
   tx: Db,
   tenantId: string,
-  leadId: string,
+  leadIds: string | Array<string | null | undefined>,
+  options: { transitionToScheduled?: boolean } = {},
 ): Promise<void> {
-  const [lead, followUps] = await Promise.all([
-    tx.lead.findFirst({
-      where: { id: leadId, tenantId },
-      select: { id: true, customFields: true },
+  const affectedLeadIds = [...new Set((Array.isArray(leadIds) ? leadIds : [leadIds]).filter(
+    (leadId): leadId is string => Boolean(leadId),
+  ))];
+  if (affectedLeadIds.length === 0) return;
+
+  const [leads, followUps] = await Promise.all([
+    tx.lead.findMany({
+      where: { id: { in: affectedLeadIds }, tenantId },
+      select: { id: true, customFields: true, status: true },
     }),
     tx.followUp.findMany({
-      where: { tenantId, leadId },
-      select: { dueDate: true, isCompleted: true, isMissed: true },
-      orderBy: { dueDate: 'asc' },
+      where: { tenantId, leadId: { in: affectedLeadIds } },
+      select: {
+        leadId: true,
+        dueDate: true,
+        isCompleted: true,
+        isMissed: true,
+        isSystemCancelled: true,
+        status: true,
+      },
     }),
   ]);
-  if (!lead) return;
 
-  await tx.lead.update({
-    where: { id: leadId },
-    data: { customFields: buildLeadFollowUpTagUpdates(lead.customFields, followUps) },
+  const followUpsByLead = new Map<string, typeof followUps>();
+  for (const followUp of followUps) {
+    if (!followUp.leadId) continue;
+    const leadFollowUps = followUpsByLead.get(followUp.leadId) ?? [];
+    leadFollowUps.push(followUp);
+    followUpsByLead.set(followUp.leadId, leadFollowUps);
+  }
+
+  const updates = leads.flatMap((lead) => {
+    const customFields = buildLeadFollowUpTagUpdates(
+      lead.customFields,
+      followUpsByLead.get(lead.id) ?? [],
+      lead.status,
+      options.transitionToScheduled,
+    );
+    return JSON.stringify(customFields) === JSON.stringify(lead.customFields)
+      ? []
+      : [{ id: lead.id, customFields }];
   });
+  if (updates.length === 0) return;
+
+  const cases = updates.map(({ id, customFields }) => (
+    Prisma.sql`WHEN ${id} THEN ${JSON.stringify(customFields)}::jsonb`
+  ));
+  await tx.$executeRaw(Prisma.sql`
+    UPDATE "Lead"
+    SET "customFields" = CASE "id" ${Prisma.join(cases, ' ')} ELSE "customFields" END,
+        "updatedAt" = CURRENT_TIMESTAMP
+    WHERE "tenantId" = ${tenantId}
+      AND "id" IN (${Prisma.join(updates.map(({ id }) => id))})
+  `);
 }
 
 export async function tagLeadSiteVisitEvents(

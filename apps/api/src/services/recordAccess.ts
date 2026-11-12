@@ -64,35 +64,14 @@ export async function getRecordScope(
 
 export async function getLeadRecordScope(user: AuthUserLike): Promise<RecordScope> {
   if (user.isSuperAdmin || user.isAdmin) return { type: 'ALL' };
+  if (await EffectivePermissionService.canViewAll(user.id, 'lead')) return { type: 'ALL' };
   return { type: 'OWNER', userId: user.id };
 }
 
-/** Shared site-visit access clause: assignee or creator of an active SCHEDULED visit. */
-function activeSiteVisitShare(userId: string) {
-  return {
-    siteVisits: {
-      some: {
-        status: 'SCHEDULED' as const,
-        OR: [{ assigneeId: userId }, { creatorId: userId }],
-      },
-    },
-  };
-}
-
-/**
- * Owner-based Lead list/detail scope.
- * ALL → no owner filter.
- * OWNER → leads this user owns, plus an active scheduled site-visit share.
- * A lead assigned to someone else stays off this user's list, even if they created it.
- */
+/** Owners see their own leads; explicit all-record scopes are handled separately. */
 export function leadScopeClause(scope: RecordScope): Record<string, unknown> | null {
   if (scope.type === 'ALL') return null;
-  return {
-    OR: [
-      { ownerId: scope.userId },
-      activeSiteVisitShare(scope.userId),
-    ],
-  };
+  return { ownerId: scope.userId };
 }
 
 export async function canAccessLead(
@@ -102,16 +81,19 @@ export async function canAccessLead(
   if (!user.isSuperAdmin && lead.tenantId !== user.tenantId) return false;
   const scope = await getLeadRecordScope(user);
   if (scope.type === 'ALL') return true;
-  if (lead.ownerId && lead.ownerId === scope.userId) return true;
-  const shared = await prisma.siteVisit.findFirst({
-    where: {
-      leadId: lead.id,
-      status: 'SCHEDULED',
-      OR: [{ assigneeId: scope.userId }, { creatorId: scope.userId }],
-    },
-    select: { id: true },
-  });
-  return Boolean(shared);
+  return lead.ownerId === scope.userId;
+}
+
+export async function canEditLead(
+  user: AuthUserLike,
+  lead: { id: string; tenantId: string; ownerId: string | null; creatorId?: string | null },
+): Promise<boolean> {
+  if (!(await canAccessLead(user, lead))) return false;
+  if (user.isSuperAdmin || user.isAdmin) return true;
+  if (await EffectivePermissionService.canEditAll(user.id, 'lead')) return true;
+  const permissions = await EffectivePermissionService.getEffectivePermissionsCached(user, user.id);
+  if (EffectivePermissionService.hasPermissionIn(permissions, 'LEAD_MODIFY_ALL')) return true;
+  return lead.ownerId === user.id;
 }
 
 export async function canAccessLeadId(user: AuthUserLike, leadId: string): Promise<boolean> {
@@ -145,9 +127,7 @@ export async function canAccessTask(
   if (!user.isSuperAdmin && task.tenantId !== user.tenantId) return false;
   const scope = await getRecordScope(user, 'Task', 'TASK');
   if (scope.type === 'ALL') return true;
-  if (task.ownerId === scope.userId) return true;
-  if (task.leadId) return canAccessLeadId(user, task.leadId);
-  return false;
+  return task.ownerId === scope.userId;
 }
 
 export async function canAccessFollowUp(
@@ -164,9 +144,7 @@ export async function canAccessActivity(
   if (activity.tenantId !== user.tenantId) return false;
   const scope = await getRecordScope(user, 'Activity', 'ACTIVITY');
   if (scope.type === 'ALL') return true;
-  if (activity.userId === scope.userId) return true;
-  if (activity.leadId) return canAccessLeadId(user, activity.leadId);
-  return false;
+  return activity.userId === scope.userId;
 }
 
 /** Merge a base where object with an optional scope clause using AND. */
@@ -202,9 +180,7 @@ const builders: Record<
   },
   task: (scope) => {
     if (scope.type === 'ALL') return null;
-    return {
-      OR: [{ ownerId: scope.userId }, { lead: leadScopeClause(scope) }],
-    };
+    return { ownerId: scope.userId };
   },
   followUp: (scope) => {
     if (scope.type === 'ALL') return null;
@@ -212,9 +188,7 @@ const builders: Record<
   },
   activity: (scope) => {
     if (scope.type === 'ALL') return null;
-    return {
-      OR: [{ userId: scope.userId }, { lead: leadScopeClause(scope) }],
-    };
+    return { userId: scope.userId };
   },
 };
 
@@ -233,8 +207,34 @@ export async function getScopeClause(
     followUp: { objectName: 'FollowUp', moduleName: 'FOLLOW_UP' },
     activity: { objectName: 'Activity', moduleName: 'ACTIVITY' },
   };
-  const scope = await getRecordScope(user, meta[kind].objectName, meta[kind].moduleName);
-  return builders[kind](scope);
+  return builders[kind](await getRecordScope(user, meta[kind].objectName, meta[kind].moduleName));
+}
+
+export async function getReportRecordAccessClause(
+  user: AuthUserLike,
+  objectName: string,
+): Promise<Record<string, unknown> | null> {
+  const normalized = objectName.replace(/[\s_-]/g, '').toLowerCase();
+  const kinds: Record<string, RecordKind> = {
+    lead: 'lead',
+    sitevisit: 'siteVisit',
+    task: 'task',
+    followup: 'followUp',
+    activity: 'activity',
+  };
+  const kind = kinds[normalized];
+  if (kind) return getScopeClause(user, kind);
+  if (normalized === 'calldetail') {
+    const scope = await getRecordScope(user, 'Activity', 'ACTIVITY');
+    if (scope.type === 'ALL') return null;
+    return {
+      OR: [
+        { ownerId: scope.userId },
+        { ownerId: null, createdById: scope.userId },
+      ],
+    };
+  }
+  return null;
 }
 
 /** Apply scope into a where clause with AND (preserves existing AND arrays). */

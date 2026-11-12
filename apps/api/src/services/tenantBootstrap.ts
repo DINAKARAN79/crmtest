@@ -17,6 +17,8 @@ const STANDARD_OBJECTS = [
   { name: 'Activity', label: 'Activity', pluralLabel: 'Activities', icon: 'activity', description: 'Track CRM activities' },
   { name: 'CallDetail', label: 'Call Detail', pluralLabel: 'Call Details', icon: 'phone', description: 'Track inbound and outbound calls', isAvailableInNavigation: false },
   { name: 'User', label: 'Users', pluralLabel: 'Users', icon: 'users', description: 'Manage CRM users and their profiles', isAvailableInNavigation: false, isAvailableInReports: false },
+  { name: 'RRQueue', label: 'Round Robin', pluralLabel: 'Round Robin', icon: 'users-round', description: 'Manage round-robin lead assignment queues', isAvailableInNavigation: false },
+  { name: 'RRQueueMember', label: 'Round Robin Member', pluralLabel: 'Round Robin Members', icon: 'users', description: 'Manage round-robin queue members', isAvailableInNavigation: false },
 ] as const;
 
 const MODULE_READ_PERMISSIONS = [

@@ -6,6 +6,9 @@ import {
   parseFilterExpression,
   canAccessReportForUser,
   canAccessDashboardForUser,
+  canViewDashboardByProfile,
+  canViewDashboardFromProfileHomepage,
+  canViewEmbeddedDashboardReport,
   canAccessReportFolderForUser,
 } from './report-engine';
 
@@ -226,6 +229,73 @@ describe('report validation', () => {
       tenantId: 'tenant-1',
       isSuperAdmin: false,
     }, ['DASHBOARD_READ'])).toBe(false);
+  });
+
+  it('lets Dashboard Read users view shared dashboards but not other users’ private dashboards', () => {
+    const user = { id: 'user-1', tenantId: 'tenant-1', isSuperAdmin: false };
+    expect(canAccessDashboardForUser({
+      createdBy: 'user-2',
+      visibility: 'SHARED',
+      tenantId: 'tenant-1',
+    }, user, ['DASHBOARD_READ'])).toBe(true);
+
+    expect(canAccessDashboardForUser({
+      createdBy: 'user-2',
+      visibility: 'PRIVATE',
+      tenantId: 'tenant-1',
+    }, user, ['DASHBOARD_READ'])).toBe(false);
+  });
+
+  it('grants dashboard view access to users whose profile the dashboard is shared with', () => {
+    expect(canViewDashboardByProfile('profile-1', ['profile-1'])).toBe(true);
+    expect(canViewDashboardByProfile('profile-2', ['profile-1'])).toBe(false);
+    expect(canViewDashboardByProfile(undefined, ['profile-1'])).toBe(false);
+  });
+
+  it('grants embedded dashboard access only when an assigned homepage contains its widget', () => {
+    expect(canViewDashboardFromProfileHomepage('dashboard-1', [[
+      { id: 'dashboard-dashboard-1', x: 0, y: 0, width: 900, height: 500 },
+    ]])).toBe(true);
+    expect(canViewDashboardFromProfileHomepage('dashboard-1', [[
+      { id: 'dashboard-dashboard-2', x: 0, y: 0, width: 900, height: 500 },
+    ]])).toBe(false);
+    expect(canViewDashboardFromProfileHomepage('dashboard-1', [null, ['report-1']])).toBe(false);
+  });
+
+  it('allows report-read users to view reports explicitly embedded in an accessible dashboard', () => {
+    const layout = [{ id: 'widget-1', config: { reportId: 'report-1' } }];
+    expect(canViewEmbeddedDashboardReport(
+      'report-1',
+      layout,
+      'tenant-1',
+      'tenant-1',
+      'tenant-1',
+      ['REPORT_READ'],
+    )).toBe(true);
+    expect(canViewEmbeddedDashboardReport(
+      'report-2',
+      layout,
+      'tenant-1',
+      'tenant-1',
+      'tenant-1',
+      ['REPORT_READ'],
+    )).toBe(false);
+    expect(canViewEmbeddedDashboardReport(
+      'report-1',
+      layout,
+      'tenant-1',
+      'tenant-1',
+      'tenant-2',
+      ['REPORT_READ'],
+    )).toBe(false);
+    expect(canViewEmbeddedDashboardReport(
+      'report-1',
+      layout,
+      'tenant-1',
+      'tenant-1',
+      'tenant-1',
+      ['DASHBOARD_READ'],
+    )).toBe(false);
   });
 
   it('grants access to folders only for their owner or shared folders when the user has report permissions', () => {

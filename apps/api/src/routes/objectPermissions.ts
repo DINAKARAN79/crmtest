@@ -3,6 +3,7 @@ import { prisma } from '@dct-crm/db';
 import { authenticate, AuthRequest } from '../middleware/auth';
 import { requirePermission } from '../middleware/permissions';
 import { invalidateCache } from '../services/metadata';
+import { EffectivePermissionService } from '../services/effectivePermissions';
 import { denyUnlessUserObjectAdmin } from '../services/userObjectAccess';
 
 const router = Router();
@@ -13,6 +14,33 @@ router.use('/:objectName', (req: AuthRequest, res: Response, next) => {
 });
 router.use(requirePermission('PROFILE_PERMISSION_MANAGE'));
 
+function getPermissionValues(input: Record<string, unknown>, existing?: {
+  canCreate: boolean;
+  canRead: boolean;
+  canUpdate: boolean;
+  canDelete: boolean;
+  viewAll: boolean;
+  modifyAll: boolean;
+}) {
+  return {
+    canCreate: typeof input.canCreate === 'boolean' ? input.canCreate : existing?.canCreate ?? false,
+    canRead: typeof input.canRead === 'boolean' ? input.canRead : existing?.canRead ?? false,
+    canUpdate: typeof input.canUpdate === 'boolean' ? input.canUpdate : existing?.canUpdate ?? false,
+    canDelete: typeof input.canDelete === 'boolean' ? input.canDelete : existing?.canDelete ?? false,
+    viewAll: typeof input.viewAll === 'boolean' ? input.viewAll : existing?.viewAll ?? false,
+    modifyAll: typeof input.modifyAll === 'boolean' ? input.modifyAll : existing?.modifyAll ?? false,
+  };
+}
+
+async function invalidateProfilePermissions(tenantId: string, profileIds: string[], objectName: string) {
+  const users = await prisma.user.findMany({
+    where: { tenantId, profileId: { in: profileIds } },
+    select: { id: true },
+  });
+  EffectivePermissionService.invalidateUserPermissionsCache(users.map(({ id }) => id));
+  invalidateCache(tenantId, objectName);
+}
+
 router.get('/:objectName', async (req: AuthRequest, res: Response) => {
   try {
     const object = await prisma.objectDefinition.findFirst({
@@ -22,13 +50,11 @@ router.get('/:objectName', async (req: AuthRequest, res: Response) => {
       return res.status(404).json({ success: false, error: 'Object not found' });
     }
 
-    const permissions = await prisma.objectPermission.findMany({
-      where: { objectId: object.id },
-      include: {
-        role: { select: { id: true, name: true } },
-      },
+    const permissions = await prisma.profileObjectPermission.findMany({
+      where: { tenantId: req.tenantId!, objectId: object.id },
+      include: { profile: { select: { id: true, name: true } } },
+      orderBy: { profile: { name: 'asc' } },
     });
-
     res.json({ success: true, data: permissions });
   } catch (error) {
     console.error('Get object permissions error:', error);
@@ -45,52 +71,30 @@ router.post('/:objectName', async (req: AuthRequest, res: Response) => {
       return res.status(404).json({ success: false, error: 'Object not found' });
     }
 
-    const { roleId, canCreate, canRead, canUpdate, canDelete, viewAll, modifyAll } = req.body;
-    if (!roleId) {
-      return res.status(400).json({ success: false, error: 'Role ID is required' });
+    const { profileId } = req.body as { profileId?: string };
+    if (!profileId) {
+      return res.status(400).json({ success: false, error: 'CRM Profile ID is required' });
     }
-
-    const role = await prisma.role.findFirst({
-      where: { id: roleId, tenantId: req.tenantId! },
+    const profile = await prisma.profile.findFirst({
+      where: { id: profileId, OR: [{ tenantId: req.tenantId! }, { isGlobal: true }] },
+      select: { id: true },
     });
-    if (!role) {
-      return res.status(404).json({ success: false, error: 'Role not found' });
+    if (!profile) {
+      return res.status(404).json({ success: false, error: 'CRM Profile not found' });
     }
 
-    const existing = await prisma.objectPermission.findUnique({
-      where: { roleId_objectId: { roleId, objectId: object.id } },
+    const permission = await prisma.profileObjectPermission.upsert({
+      where: { profileId_objectId: { profileId, objectId: object.id } },
+      create: {
+        tenantId: req.tenantId!,
+        profileId,
+        objectId: object.id,
+        ...getPermissionValues(req.body),
+      },
+      update: getPermissionValues(req.body),
     });
 
-    let permission;
-    if (existing) {
-      permission = await prisma.objectPermission.update({
-        where: { id: existing.id },
-        data: {
-          canCreate: canCreate ?? existing.canCreate,
-          canRead: canRead ?? existing.canRead,
-          canUpdate: canUpdate ?? existing.canUpdate,
-          canDelete: canDelete ?? existing.canDelete,
-          viewAll: viewAll ?? existing.viewAll,
-          modifyAll: modifyAll ?? existing.modifyAll,
-        },
-      });
-    } else {
-      permission = await prisma.objectPermission.create({
-        data: {
-          tenantId: req.tenantId!,
-          roleId,
-          objectId: object.id,
-          canCreate: canCreate || false,
-          canRead: canRead || false,
-          canUpdate: canUpdate || false,
-          canDelete: canDelete || false,
-          viewAll: viewAll || false,
-          modifyAll: modifyAll || false,
-        },
-      });
-    }
-
-    invalidateCache(req.tenantId!, object.name);
+    await invalidateProfilePermissions(req.tenantId!, [profileId], object.name);
     res.json({ success: true, data: permission });
   } catch (error) {
     console.error('Set object permission error:', error);
@@ -107,58 +111,48 @@ router.post('/:objectName/bulk', async (req: AuthRequest, res: Response) => {
       return res.status(404).json({ success: false, error: 'Object not found' });
     }
 
-    const { permissions } = req.body;
+    const { permissions } = req.body as { permissions?: Array<Record<string, unknown> & { profileId?: string }> };
     if (!Array.isArray(permissions)) {
       return res.status(400).json({ success: false, error: 'Permissions array is required' });
     }
-
-    const results = [];
-    for (const perm of permissions) {
-      const { roleId, canCreate, canRead, canUpdate, canDelete, viewAll, modifyAll } = perm;
-      if (!roleId) continue;
-
-      const role = await prisma.role.findFirst({
-        where: { id: roleId, tenantId: req.tenantId! },
-        select: { id: true },
-      });
-      if (!role) continue;
-
-      const existing = await prisma.objectPermission.findUnique({
-        where: { roleId_objectId: { roleId, objectId: object.id } },
-      });
-
-      if (existing) {
-        const updated = await prisma.objectPermission.update({
-          where: { id: existing.id },
-          data: {
-            canCreate: canCreate ?? existing.canCreate,
-            canRead: canRead ?? existing.canRead,
-            canUpdate: canUpdate ?? existing.canUpdate,
-            canDelete: canDelete ?? existing.canDelete,
-            viewAll: viewAll ?? existing.viewAll,
-            modifyAll: modifyAll ?? existing.modifyAll,
-          },
-        });
-        results.push(updated);
-      } else {
-        const created = await prisma.objectPermission.create({
-          data: {
-            tenantId: req.tenantId!,
-            roleId,
-            objectId: object.id,
-            canCreate: canCreate || false,
-            canRead: canRead || false,
-            canUpdate: canUpdate || false,
-            canDelete: canDelete || false,
-            viewAll: viewAll || false,
-            modifyAll: modifyAll || false,
-          },
-        });
-        results.push(created);
-      }
+    if (permissions.some(({ profileId }) => typeof profileId !== 'string' || !profileId)) {
+      return res.status(400).json({ success: false, error: 'Each permission requires a CRM Profile ID' });
     }
 
-    invalidateCache(req.tenantId!, object.name);
+    const profileIds = [...new Set(permissions.map(({ profileId }) => profileId).filter(
+      (profileId): profileId is string => typeof profileId === 'string' && profileId.length > 0,
+    ))];
+    const profiles = profileIds.length
+      ? await prisma.profile.findMany({
+        where: { id: { in: profileIds }, OR: [{ tenantId: req.tenantId! }, { isGlobal: true }] },
+          select: { id: true },
+        })
+      : [];
+    const validProfileIds = new Set(profiles.map(({ id }) => id));
+    if (profileIds.some((profileId) => !validProfileIds.has(profileId))) {
+      return res.status(400).json({ success: false, error: 'One or more CRM Profiles were not found in this company' });
+    }
+    const results = await prisma.$transaction(
+      permissions.map((permission) => prisma.profileObjectPermission.upsert({
+          where: {
+            profileId_objectId: {
+              profileId: permission.profileId!,
+              objectId: object.id,
+            },
+          },
+          create: {
+            tenantId: req.tenantId!,
+            profileId: permission.profileId!,
+            objectId: object.id,
+            ...getPermissionValues(permission),
+          },
+          update: getPermissionValues(permission),
+        })),
+    );
+
+    if (profileIds.length) {
+      await invalidateProfilePermissions(req.tenantId!, profileIds, object.name);
+    }
     res.json({ success: true, data: results });
   } catch (error) {
     console.error('Bulk set permissions error:', error);
@@ -175,16 +169,16 @@ router.delete('/:objectName/:permissionId', async (req: AuthRequest, res: Respon
       return res.status(404).json({ success: false, error: 'Object not found' });
     }
 
-    const existing = await prisma.objectPermission.findFirst({
-      where: { id: req.params.permissionId, objectId: object.id },
+    const existing = await prisma.profileObjectPermission.findFirst({
+      where: { id: req.params.permissionId, tenantId: req.tenantId!, objectId: object.id },
+      select: { id: true, profileId: true },
     });
     if (!existing) {
       return res.status(404).json({ success: false, error: 'Permission not found' });
     }
 
-    await prisma.objectPermission.delete({ where: { id: req.params.permissionId } });
-
-    invalidateCache(req.tenantId!, object.name);
+    await prisma.profileObjectPermission.delete({ where: { id: existing.id } });
+    await invalidateProfilePermissions(req.tenantId!, [existing.profileId], object.name);
     res.json({ success: true, message: 'Permission deleted successfully' });
   } catch (error) {
     console.error('Delete permission error:', error);

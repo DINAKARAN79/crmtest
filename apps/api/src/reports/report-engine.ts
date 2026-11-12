@@ -2,6 +2,7 @@ import { prisma } from "@dct-crm/db";
 import { getTenantTimezone } from "../services/tenantTimezone";
 import { DEFAULT_CRM_TIMEZONE, crmDateToUtcStart } from "@dct-crm/shared";
 import { REPORT_OBJECTS, ReportField, reportObjectFromPrismaModel } from "./report-metadata";
+import { getReportRecordAccessClause, type AuthUserLike } from "../services/recordAccess";
 
 export type AggregateFunction =
   | "count"
@@ -234,6 +235,7 @@ export interface RunReportInput {
   };
   filterLogic?: "AND" | "OR";
   showMe?: "all" | "mine";
+  user?: AuthUserLike;
   groupBy?: string;
   groupColumn?: string;
   rowGroups?: string[];
@@ -673,6 +675,7 @@ function buildWhere(
   showMe: "all" | "mine" = "all",
   userId?: string,
   timeZone = DEFAULT_CRM_TIMEZONE,
+  recordAccessWhere?: Record<string, unknown> | null,
 ) {
   const validFilters = filters.filter((filter) => {
     const field = objectConfig.fields[filter.field];
@@ -693,7 +696,10 @@ function buildWhere(
     return true;
   });
 
-  const systemConditions = showMe === "mine" && userId && objectConfig.fields.ownerId ? [{ ownerId: userId }] : [];
+  const systemConditions = [
+    ...(showMe === "mine" && userId && objectConfig.fields.ownerId ? [{ ownerId: userId }] : []),
+    ...(recordAccessWhere ? [recordAccessWhere] : []),
+  ];
   if (validFilters.length === 0) {
     return { AND: [{ tenantId }, ...systemConditions] };
   }
@@ -1157,7 +1163,7 @@ export function canAccessReportForUser(
 }
 
 export function canAccessDashboardForUser(
-  dashboard: { createdBy?: string | null; isDefault?: boolean | null; tenantId?: string | null },
+  dashboard: { createdBy?: string | null; isDefault?: boolean | null; visibility?: string | null; tenantId?: string | null },
   user: { id: string; tenantId: string; isSuperAdmin?: boolean },
   permissions: string[] = [],
 ) {
@@ -1173,7 +1179,63 @@ export function canAccessDashboardForUser(
     return false;
   }
 
-  return dashboard.createdBy === user.id || Boolean(dashboard.isDefault);
+  return dashboard.createdBy === user.id ||
+    Boolean(dashboard.isDefault) ||
+    dashboard.visibility === 'SHARED' ||
+    dashboard.visibility === 'PUBLIC';
+}
+
+export function canViewDashboardByProfile(profileId: string | undefined, sharedProfileIds: string[]) {
+  return Boolean(profileId && sharedProfileIds.includes(profileId));
+}
+
+export function canViewDashboardFromProfileHomepage(
+  dashboardId: string,
+  homepageLayouts: unknown[],
+) {
+  const widgetId = `dashboard-${dashboardId}`;
+  return homepageLayouts.some(
+    (layout) =>
+      Array.isArray(layout) &&
+      layout.some(
+        (item) =>
+          item === widgetId ||
+          (typeof item === 'object' &&
+            item !== null &&
+            'id' in item &&
+            item.id === widgetId),
+      ),
+  );
+}
+
+export function canViewEmbeddedDashboardReport(
+  reportId: string,
+  dashboardLayout: unknown,
+  reportTenantId: string,
+  dashboardTenantId: string,
+  userTenantId: string,
+  permissions: string[],
+) {
+  if (
+    reportTenantId !== userTenantId ||
+    dashboardTenantId !== userTenantId ||
+    (!permissions.includes('REPORT_VIEW') && !permissions.includes('REPORT_READ'))
+  ) {
+    return false;
+  }
+
+  if (!Array.isArray(dashboardLayout)) return false;
+  return dashboardLayout.some((widget) => {
+    if (typeof widget !== 'object' || widget === null) return false;
+    const config =
+      'config' in widget && typeof widget.config === 'object' && widget.config !== null
+        ? widget.config
+        : null;
+    return (
+      ('reportId' in widget && widget.reportId === reportId) ||
+      (config !== null && 'reportId' in config && config.reportId === reportId)
+    );
+  });
 }
 
 export function canAccessReportFolderForUser(
@@ -1365,6 +1427,15 @@ export async function runReport(input: RunReportInput) {
     addFieldSelect(select, aggregateField);
   }
 
+  const scopedModels = new Set(["lead", "sitevisit", "task", "followup", "activity", "calldetail"]);
+  const isScopedReport = scopedModels.has(input.objectName.replace(/[\s_-]/g, "").toLowerCase());
+  if (isScopedReport && !input.user) {
+    throw new Error("User context is required to run this report");
+  }
+  const recordAccessWhere = input.user
+    ? await getReportRecordAccessClause(input.user, input.objectName)
+    : null;
+
   const fetchedRecords = dynamicRecords ||
     await delegate.findMany({
       where: applyCrossFilter(
@@ -1377,6 +1448,7 @@ export async function runReport(input: RunReportInput) {
           input.showMe || "all",
           input.userId,
           timeZone,
+          recordAccessWhere,
         ),
         input.objectName,
         input.crossFilter,
@@ -1386,6 +1458,13 @@ export async function runReport(input: RunReportInput) {
 
   const workingRecords = dynamicRecords
     ? fetchedRecords.filter((record: any) => {
+        if (
+          recordAccessWhere &&
+          "ownerId" in recordAccessWhere &&
+          record.ownerId !== recordAccessWhere.ownerId
+        ) {
+          return false;
+        }
         const filters = input.filters || [];
 
         if (filters.length === 0) {

@@ -1861,9 +1861,9 @@ function HomepageBuilder() {
       )}
       {profilePickerOpen && (
         <div className="fixed inset-0 z-[90] flex items-center justify-center bg-black/40 p-4">
-          <div className="w-full max-w-2xl rounded-lg bg-card p-6 shadow-md">
-            <div className="flex items-center justify-between">
-              <h2 className="text-[16px] font-semibold">Share with</h2>
+          <div className="flex max-h-[85vh] w-full max-w-xl flex-col rounded-lg bg-card p-4 shadow-md">
+            <div className="flex shrink-0 items-center justify-between">
+              <h2 className="text-sm font-semibold">Share with</h2>
               <button
                 onClick={() => setProfilePickerOpen(false)}
                 aria-label="Close"
@@ -1871,58 +1871,66 @@ function HomepageBuilder() {
                 <X className="h-5 w-5" />
               </button>
             </div>
-            <div className="mt-5 grid min-h-[300px] grid-cols-2 rounded-md border">
-              <div className="border-r">
-                <div className="flex items-center border-b px-3">
+            <div className="mt-3 grid h-[60vh] min-h-[220px] max-h-[480px] grid-cols-2 overflow-hidden rounded-md border">
+              <div className="flex min-h-0 flex-col border-r">
+                <div className="flex shrink-0 items-center border-b px-3">
                   <Search className="h-4 w-4 text-muted-foreground" />
                   <input
                     value={profileSearch}
                     onChange={(event) => setProfileSearch(event.target.value)}
                     placeholder="Search profiles"
-                    className="h-9 w-full bg-transparent px-2 text-[13px] outline-none"
+                    className="h-8 w-full bg-transparent px-2 text-xs outline-none"
                   />
                 </div>
-                {availableProfiles.map((profile) => (
-                  <div
-                    key={profile.id}
-                    className="flex items-center justify-between px-3 py-2"
-                  >
-                    <span className="text-sm">{profile.name}</span>
-                    <Button
-                      size="sm"
-                      onClick={() =>
-                        setProfileIds((current) => [...current, profile.id])
-                      }
+                <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain">
+                  {availableProfiles.map((profile) => (
+                    <div
+                      key={profile.id}
+                      className="flex items-center justify-between gap-2 px-3 py-1.5"
                     >
-                      Add
-                    </Button>
-                  </div>
-                ))}
+                      <span className="truncate text-xs">{profile.name}</span>
+                      <Button
+                        size="sm"
+                        className="h-7 shrink-0 px-2 text-xs"
+                        onClick={() =>
+                          setProfileIds((current) => [...current, profile.id])
+                        }
+                      >
+                        Add
+                      </Button>
+                    </div>
+                  ))}
+                  {!availableProfiles.length && (
+                    <p className="p-3 text-xs text-muted-foreground">No profiles found.</p>
+                  )}
+                </div>
               </div>
-              <div className="p-4">
-                <p className="font-medium">Selected</p>
-                {profileIds.map((id) => (
-                  <div
-                    key={id}
-                    className="mt-2 flex items-center justify-between rounded bg-muted px-3 py-2 text-sm"
-                  >
-                    {profiles.find((profile) => profile.id === id)?.name}
-                    <button
-                      onClick={() =>
-                        setProfileIds((current) =>
-                          current.filter((item) => item !== id),
-                        )
-                      }
-                      aria-label="Remove profile"
+              <div className="flex min-h-0 flex-col p-3">
+                <p className="shrink-0 text-sm font-medium">Selected</p>
+                <div className="mt-1 min-h-0 flex-1 overflow-y-auto overscroll-contain">
+                  {profileIds.map((id) => (
+                    <div
+                      key={id}
+                      className="mt-2 flex items-center justify-between gap-2 rounded bg-muted px-2 py-1.5 text-xs"
                     >
-                      <X className="h-4 w-4" />
-                    </button>
-                  </div>
-                ))}
+                      <span className="truncate">{profiles.find((profile) => profile.id === id)?.name}</span>
+                      <button
+                        onClick={() =>
+                          setProfileIds((current) =>
+                            current.filter((item) => item !== id),
+                          )
+                        }
+                        aria-label="Remove profile"
+                      >
+                        <X className="h-4 w-4" />
+                      </button>
+                    </div>
+                  ))}
+                </div>
               </div>
             </div>
-            <div className="mt-5 flex justify-end">
-              <Button onClick={() => setProfilePickerOpen(false)}>Save</Button>
+            <div className="mt-3 flex shrink-0 justify-end">
+              <Button size="sm" onClick={() => setProfilePickerOpen(false)}>Save</Button>
             </div>
           </div>
         </div>

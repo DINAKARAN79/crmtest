@@ -3,6 +3,8 @@ import { prisma } from '@dct-crm/db';
 import { z } from 'zod';
 import { authenticate, AuthRequest } from '../middleware/auth';
 import { requirePermission } from '../middleware/permissions';
+import { CRM_SIDEBAR_ITEMS } from '@dct-crm/shared';
+import { EffectivePermissionService } from '../services/effectivePermissions';
 
 export type ProfileSecurityObjectPermission = {
   objectId: string;
@@ -130,6 +132,8 @@ const updateSecuritySchema = z.object({
     canEdit: z.boolean(),
   })).optional(),
   recordAccess: z.record(z.enum(['OWN', 'TEAM', 'ALL'])).optional(),
+  sidebarAccess: z.array(z.string()).optional(),
+  permissionSetIds: z.array(z.string()).optional(),
   permissionIds: z.array(z.string()).optional(),
 });
 
@@ -141,7 +145,7 @@ router.get('/:profileId/security', requirePermission('PROFILE_READ'), async (req
     });
     if (!profile) return res.status(404).json({ success: false, error: 'Profile not found' });
 
-    const [objects, objectPermissions, fieldPermissions, permissions] = await Promise.all([
+    const [objects, objectPermissions, fieldPermissions, permissions, permissionSets, profilePermissionSetAssignments] = await Promise.all([
       prisma.objectDefinition.findMany({
         where: { tenantId: profile.tenantId, isActive: true },
         select: { id: true, name: true, label: true, fields: { where: { isActive: true }, select: { id: true, name: true, label: true, fieldType: true }, orderBy: { displayOrder: 'asc' } } },
@@ -150,6 +154,15 @@ router.get('/:profileId/security', requirePermission('PROFILE_READ'), async (req
       prisma.profileObjectPermission.findMany({ where: { profileId: req.params.profileId, tenantId: profile.tenantId } }),
       prisma.profileFieldPermission.findMany({ where: { profileId: req.params.profileId, tenantId: profile.tenantId } }),
       prisma.userProfilePermission.findMany({ where: { profileId: req.params.profileId, permission: { isActive: true } }, include: { permission: true } }),
+      prisma.newPermissionSet.findMany({
+        where: { tenantId: profile.tenantId, isActive: true },
+        select: { id: true, name: true, description: true },
+        orderBy: { name: 'asc' },
+      }),
+      prisma.profilePermissionSetAssignment.findMany({
+        where: { profileId: profile.id, permissionSet: { tenantId: profile.tenantId, isActive: true } },
+        select: { permissionSetId: true },
+      }),
     ]);
 
     const objectNameMap = Object.fromEntries(objects.map((objectDefinition) => [objectDefinition.id, objectDefinition.name]));
@@ -164,7 +177,25 @@ router.get('/:profileId/security', requirePermission('PROFILE_READ'), async (req
     const storedAccess = profile.leadStatusAccess && typeof profile.leadStatusAccess === 'object' && !Array.isArray(profile.leadStatusAccess)
       ? profile.leadStatusAccess as Record<string, any>
       : {};
-    res.json({ success: true, data: { profile, objects, objectPermissions: sanitizedObjectPermissions, fieldPermissions, permissions: permissions.map((item) => item.permission), recordAccess: storedAccess.recordAccess || {} } });
+    const availableSidebarItems = new Set<string>(CRM_SIDEBAR_ITEMS.map(({ id }) => id));
+    const sidebarAccess = Array.isArray(storedAccess.sidebarAccess)
+      ? [...new Set(storedAccess.sidebarAccess.filter((item): item is string => typeof item === 'string' && availableSidebarItems.has(item)))]
+      : null;
+    if (sidebarAccess) {
+      if (!sidebarAccess.includes('home')) sidebarAccess.push('home');
+      if (profile.isAdmin && !sidebarAccess.includes('setup')) sidebarAccess.push('setup');
+    }
+    res.json({ success: true, data: {
+      profile,
+      objects,
+      objectPermissions: sanitizedObjectPermissions,
+      fieldPermissions,
+      permissions: permissions.map((item) => item.permission),
+      permissionSets,
+      permissionSetIds: profilePermissionSetAssignments.map((item) => item.permissionSetId),
+      recordAccess: storedAccess.recordAccess || {},
+      sidebarAccess,
+    } });
   } catch (error) {
     console.error('Get profile security error:', error);
     res.status(500).json({ success: false, error: 'Failed to fetch profile security' });
@@ -176,10 +207,26 @@ router.put('/:profileId/security', requirePermission('PROFILE_PERMISSION_MANAGE'
     const data = updateSecuritySchema.parse(req.body);
     const profile = await prisma.profile.findFirst({
       where: getProfileScope(req, req.params.profileId),
-      select: { id: true, leadStatusAccess: true, tenantId: true },
+      select: { id: true, name: true, isAdmin: true, leadStatusAccess: true, tenantId: true },
     });
     if (!profile) return res.status(404).json({ success: false, error: 'Profile not found' });
     const tenantId = profile.tenantId;
+
+    if (data.sidebarAccess !== undefined) {
+      const availableSidebarItems = new Set<string>(CRM_SIDEBAR_ITEMS.map(({ id }) => id));
+      if (new Set(data.sidebarAccess).size !== data.sidebarAccess.length) {
+        return res.status(400).json({ success: false, error: 'Sidebar items cannot be duplicated' });
+      }
+      if (data.sidebarAccess.some((item) => !availableSidebarItems.has(item))) {
+        return res.status(400).json({ success: false, error: 'One or more sidebar items are invalid' });
+      }
+      if (!data.sidebarAccess.includes('home')) {
+        return res.status(400).json({ success: false, error: 'Home access must remain enabled for every profile' });
+      }
+      if (profile.isAdmin && !data.sidebarAccess.includes('setup')) {
+        return res.status(400).json({ success: false, error: 'Setup access must remain enabled for administrator profiles' });
+      }
+    }
 
     if (data.objectPermissions?.length) {
       const objectIds = [...new Set(data.objectPermissions.map((item) => item.objectId))];
@@ -198,6 +245,22 @@ router.put('/:profileId/security', requirePermission('PROFILE_PERMISSION_MANAGE'
       const permissionCount = await prisma.permission.count({ where: { id: { in: permissionIds }, isActive: true } });
       if (permissionCount !== permissionIds.length) return res.status(400).json({ success: false, error: 'One or more permissions are invalid or inactive' });
     }
+
+    const permissionSetIds = data.permissionSetIds === undefined ? undefined : [...new Set(data.permissionSetIds)];
+    if (permissionSetIds) {
+      const validPermissionSetCount = await prisma.newPermissionSet.count({
+        where: { id: { in: permissionSetIds }, tenantId, isActive: true },
+      });
+      if (validPermissionSetCount !== permissionSetIds.length) {
+        return res.status(400).json({ success: false, error: 'One or more Permission Sets are invalid, inactive, or outside this company' });
+      }
+    }
+    const previousPermissionSetIds = permissionSetIds
+      ? (await prisma.profilePermissionSetAssignment.findMany({
+          where: { profileId: profile.id },
+          select: { permissionSetId: true },
+        })).map((item) => item.permissionSetId)
+      : undefined;
 
     const objectNameMap = data.objectPermissions?.length
       ? Object.fromEntries(
@@ -240,11 +303,47 @@ router.put('/:profileId/security', requirePermission('PROFILE_PERMISSION_MANAGE'
         await tx.userProfilePermission.deleteMany({ where: { profileId: profile.id } });
         if (normalizedPermissionIds.length) await tx.userProfilePermission.createMany({ data: normalizedPermissionIds.map((permissionId) => ({ profileId: profile.id, permissionId })) });
       }
-      if (data.recordAccess) {
+      if (permissionSetIds) {
+        await tx.profilePermissionSetAssignment.deleteMany({ where: { profileId: profile.id } });
+        if (permissionSetIds.length) {
+          await tx.profilePermissionSetAssignment.createMany({
+            data: permissionSetIds.map((permissionSetId) => ({ profileId: profile.id, permissionSetId })),
+          });
+        }
+      }
+      if (data.recordAccess !== undefined || data.sidebarAccess !== undefined) {
         const current = profile.leadStatusAccess && typeof profile.leadStatusAccess === 'object' && !Array.isArray(profile.leadStatusAccess) ? profile.leadStatusAccess as Record<string, any> : {};
-        await tx.profile.update({ where: { id: profile.id }, data: { leadStatusAccess: { ...current, recordAccess: data.recordAccess } } });
+        await tx.profile.update({
+          where: { id: profile.id },
+          data: {
+            leadStatusAccess: {
+              ...current,
+              ...(data.recordAccess !== undefined ? { recordAccess: data.recordAccess } : {}),
+              ...(data.sidebarAccess !== undefined ? { sidebarAccess: data.sidebarAccess } : {}),
+            },
+          },
+        });
       }
     });
+
+    if (permissionSetIds) {
+      const assignedUsers = await prisma.user.findMany({
+        where: { profileId: profile.id, tenantId },
+        select: { id: true },
+      });
+      EffectivePermissionService.invalidateUserPermissionsCache(assignedUsers.map((user) => user.id));
+      await prisma.auditLog.create({
+        data: {
+          tenantId,
+          userId: req.user!.id,
+          action: 'UPDATE',
+          objectType: 'ProfilePermissionSetAssignment',
+          objectId: profile.id,
+          oldValues: { permissionSetIds: previousPermissionSetIds },
+          newValues: { permissionSetIds },
+        },
+      });
+    }
 
     res.json({ success: true, message: 'Profile security updated' });
   } catch (error: any) {

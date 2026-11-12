@@ -926,6 +926,15 @@ export default function UsersPage() {
                         Full System Access
                       </div>
                     )}
+                    {effectivePerms.leadAllAccess?.viewAll && (
+                      <div className="space-y-1">
+                        {[...new Set<string>((effectivePerms.leadAllAccess.sources || []).map((source: { sourceName: string }) => source.sourceName))].map((setName) => (
+                          <div key={setName} className="p-3 rounded-md bg-amber-50 border border-amber-200 text-amber-900 text-sm font-medium">
+                            All Leads access via {setName}
+                          </div>
+                        ))}
+                      </div>
+                    )}
                     {Object.entries(effectivePerms.byModule || {}).map(([module, perms]: [string, any]) => (
                       <div key={module}>
                         <p className="text-xs font-semibold text-muted-foreground uppercase mb-1">{module}</p>

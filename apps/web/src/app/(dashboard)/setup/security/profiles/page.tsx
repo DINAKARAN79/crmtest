@@ -23,11 +23,12 @@ import {
 import { useToast } from "@/hooks/use-toast";
 import { companyApi, permissionApi, profileApi, profileSecurityApi } from "@/lib/api";
 import { useAuth } from "@/contexts/auth-context";
+import { CRM_SIDEBAR_ITEMS } from "@dct-crm/shared";
 
 type Scope = "OWN" | "TEAM" | "ALL";
 type ObjectPermission = { objectId: string; canCreate: boolean; canRead: boolean; canUpdate: boolean; canDelete: boolean; viewAll: boolean; modifyAll: boolean };
 type FieldPermission = { fieldId: string; canRead: boolean; canEdit: boolean };
-type SecurityData = { profile: any; objects: any[]; objectPermissions: ObjectPermission[]; fieldPermissions: FieldPermission[]; permissions: any[]; recordAccess: Record<string, Scope> };
+type SecurityData = { profile: any; objects: any[]; objectPermissions: ObjectPermission[]; fieldPermissions: FieldPermission[]; permissions: any[]; permissionSets: Array<{ id: string; name: string; description?: string | null }>; permissionSetIds: string[]; recordAccess: Record<string, Scope>; sidebarAccess: string[] | null };
 
 const modules = ["Lead", "Opportunity", "SiteVisit", "Quotation", "Booking", "Payment", "Project", "Unit", "Report", "Dashboard", "User", "Role"];
 const actions = ["CREATE", "READ", "UPDATE", "DELETE"] as const;
@@ -209,6 +210,8 @@ export default function SetupProfilesPage() {
         objectPermissions: security.objectPermissions,
         fieldPermissions: security.fieldPermissions,
         recordAccess: security.recordAccess,
+        sidebarAccess: security.sidebarAccess ?? CRM_SIDEBAR_ITEMS.map(({ id }) => id),
+        permissionSetIds: security.permissionSetIds,
         permissionIds: permissionIdsToKeep,
       }, isSuperAdmin ? profileTenantId : undefined);
       toast({ title: "Profile saved", description: `${selected.name} security settings were updated.` });
@@ -284,7 +287,7 @@ export default function SetupProfilesPage() {
     {isSuperAdmin && <div className="max-w-md space-y-2"><Label htmlFor="profile-company">Company</Label><select id="profile-company" className="h-10 w-full rounded-md border border-input bg-background px-3 text-sm" value={profileTenantId} onChange={(event) => { setSelected(null); setSecurity(null); setProfiles([]); setLoading(true); setProfileTenantId(event.target.value); }}><option value="">Select a company</option>{companies.map((company) => <option key={company.id} value={company.id}>{company.name}</option>)}</select></div>}
     <div className="grid gap-6 lg:grid-cols-[280px_1fr]">
       <Card className="h-fit"><CardHeader><CardTitle className="flex items-center gap-2"><Shield className="h-5 w-5" /> Profile list</CardTitle><div className="relative"><Search className="absolute left-3 top-3 h-4 w-4 text-muted-foreground" /><Input className="pl-9" placeholder="Search profiles" value={search} onChange={(event) => setSearch(event.target.value)} /></div></CardHeader><CardContent className="space-y-2">{loading ? <p className="text-sm text-muted-foreground">Loading profiles...</p> : filteredProfiles.map((profile) => <button key={profile.id} type="button" onClick={() => { setSelected(profile); setTab("overview"); }} className={`w-full rounded-md border p-3 text-left ${selected?.id === profile.id ? "border-primary bg-primary/5" : "hover:bg-muted/50"}`}><div className="flex items-center justify-between gap-2"><span className="font-medium">{profile.name}</span>{profile.isAdmin && <Badge>Admin</Badge>}</div><p className="mt-1 text-xs text-muted-foreground">{profile.description || "No description"}</p><p className="mt-2 flex items-center gap-1 text-xs text-muted-foreground"><Users className="h-3 w-3" /> {profile._count?.users || 0} users</p></button>)}</CardContent></Card>
-      <Card><CardHeader><div className="flex flex-wrap items-center justify-between gap-3"><div><CardTitle>{selected?.name || "Select a profile"}</CardTitle><p className="mt-1 text-sm text-muted-foreground">{selected?.description || "Choose a profile to configure its security model."}</p>{selected && deleteBlockedReason && <p className="mt-2 text-sm text-muted-foreground">{deleteBlockedReason}</p>}</div><div className="flex gap-2"><Button variant="outline" onClick={() => setDeleteDialogOpen(true)} disabled={!selected || Boolean(deleteBlockedReason) || deleting} title={deleteBlockedReason || undefined}><Trash2 className="mr-2 h-4 w-4" />Delete profile</Button><Button onClick={save} disabled={!security || saving}><Save className="mr-2 h-4 w-4" />{saving ? "Saving..." : "Save profile"}</Button></div></div><div className="flex flex-wrap gap-2 border-b pt-4">{["overview", "objects", "records", "system"].map((item) => <button key={item} type="button" onClick={() => setTab(item)} className={`border-b-2 px-3 py-2 text-sm capitalize ${tab === item ? "border-primary text-primary" : "border-transparent text-muted-foreground"}`}>{item === "objects" ? "Modules & Actions" : item === "records" ? "Record Access" : item === "system" ? "Reports, Dashboards & System" : item}</button>)}</div></CardHeader><CardContent>{loadingSecurity ? <p className="py-10 text-sm text-muted-foreground">Loading profile security...</p> : !security ? <p className="py-10 text-sm text-muted-foreground">Select a profile.</p> : <ProfileEditor tab={tab} security={security} modules={modules} systemPermissions={systemPermissions} updateObject={updateObject} toggleSystemPermission={toggleSystemPermission} setSecurity={setSecurity} />}</CardContent></Card>
+      <Card><CardHeader><div className="flex flex-wrap items-center justify-between gap-3"><div><CardTitle>{selected?.name || "Select a profile"}</CardTitle><p className="mt-1 text-sm text-muted-foreground">{selected?.description || "Choose a profile to configure its security model."}</p>{selected && deleteBlockedReason && <p className="mt-2 text-sm text-muted-foreground">{deleteBlockedReason}</p>}</div><div className="flex gap-2"><Button variant="outline" onClick={() => setDeleteDialogOpen(true)} disabled={!selected || Boolean(deleteBlockedReason) || deleting} title={deleteBlockedReason || undefined}><Trash2 className="mr-2 h-4 w-4" />Delete profile</Button><Button onClick={save} disabled={!security || saving}><Save className="mr-2 h-4 w-4" />{saving ? "Saving..." : "Save profile"}</Button></div></div><div className="flex flex-wrap gap-2 border-b pt-4">{["overview", "objects", "records", "sidebar", "permission-sets", "system"].map((item) => <button key={item} type="button" onClick={() => setTab(item)} className={`border-b-2 px-3 py-2 text-sm capitalize ${tab === item ? "border-primary text-primary" : "border-transparent text-muted-foreground"}`}>{item === "objects" ? "Modules & Actions" : item === "records" ? "Record Access" : item === "sidebar" ? "Sidebar Access" : item === "permission-sets" ? "Permission Sets" : item === "system" ? "Reports, Dashboards & System" : item}</button>)}</div></CardHeader><CardContent>{loadingSecurity ? <p className="py-10 text-sm text-muted-foreground">Loading profile security...</p> : !security ? <p className="py-10 text-sm text-muted-foreground">Select a profile.</p> : <ProfileEditor tab={tab} security={security} modules={modules} systemPermissions={systemPermissions} updateObject={updateObject} toggleSystemPermission={toggleSystemPermission} setSecurity={setSecurity} />}</CardContent></Card>
     </div>
     <Dialog open={createOpen} onOpenChange={setCreateOpen}><DialogContent><DialogHeader><DialogTitle>Create Setup Profile</DialogTitle></DialogHeader><div className="grid gap-4 py-3"><div><Label htmlFor="setup-profile-name">Profile name</Label><Input id="setup-profile-name" value={createName} onChange={(event) => setCreateName(event.target.value)} placeholder="Sales Executive" /></div><div><Label htmlFor="setup-profile-description">Description</Label><Input id="setup-profile-description" value={createDescription} onChange={(event) => setCreateDescription(event.target.value)} placeholder="Own leads and site visits" /></div>{isSuperAdmin && <label className="flex items-center gap-2 text-sm"><input type="checkbox" checked={createAdmin} onChange={(event) => setCreateAdmin(event.target.checked)} /> Profile administrator</label>}</div><DialogFooter><Button variant="outline" onClick={() => setCreateOpen(false)}>Cancel</Button><Button onClick={createProfile} disabled={creating || (isSuperAdmin && !profileTenantId)}>{creating ? "Creating..." : "Create Profile"}</Button></DialogFooter></DialogContent></Dialog>
     <AlertDialog open={deleteDialogOpen} onOpenChange={(open) => { if (!deleting) setDeleteDialogOpen(open); }}>
@@ -312,10 +315,67 @@ export default function SetupProfilesPage() {
 }
 
 function ProfileEditor({ tab, security, modules, systemPermissions, updateObject, toggleSystemPermission, setSecurity }: { tab: string; security: SecurityData; modules: string[]; systemPermissions: any[]; updateObject: (id: string, patch: Partial<ObjectPermission>) => void; toggleSystemPermission: (id: string) => void; setSecurity: React.Dispatch<React.SetStateAction<SecurityData | null>> }) {
-  if (tab === "overview") return <div className="grid gap-5 md:grid-cols-2"><Summary title="Object permissions" value={`${security.objectPermissions.length} configured`} /><Summary title="Field permissions" value={`${security.fieldPermissions.length} configured`} /><Summary title="Record access" value={`${Object.keys(security.recordAccess).length} modules scoped`} /><Summary title="System permissions" value={`${security.permissions.length} assigned`} /><div className="md:col-span-2 rounded-lg border bg-muted/20 p-4 text-sm text-muted-foreground">Profiles provide baseline access. Permission sets and direct permissions can add access for individual users without changing the profile.</div></div>;
+  const sidebarAccess = security.sidebarAccess ?? CRM_SIDEBAR_ITEMS.map(({ id }) => id);
+  if (tab === "overview") return <div className="grid gap-5 md:grid-cols-2"><Summary title="Object permissions" value={`${security.objectPermissions.length} configured`} /><Summary title="Field permissions" value={`${security.fieldPermissions.length} configured`} /><Summary title="Record access" value={`${Object.keys(security.recordAccess).length} modules scoped`} /><Summary title="Permission Sets" value={`${security.permissionSetIds.length} assigned`} /><Summary title="System permissions" value={`${security.permissions.length} assigned`} /><div className="md:col-span-2 rounded-lg border bg-muted/20 p-4 text-sm text-muted-foreground">Profiles provide baseline access. Assigned Permission Sets are inherited by every active user with this profile.</div></div>;
   if (tab === "objects") return <div className="space-y-4">{security.objects.filter((object) => modules.includes(object.name) || modules.includes(object.label)).map((object) => { const permission = security.objectPermissions.find((item) => item.objectId === object.id) || { objectId: object.id, canCreate: false, canRead: false, canUpdate: false, canDelete: false, viewAll: false, modifyAll: false }; return <div key={object.id} className="rounded-lg border p-4"><div className="mb-3 flex items-center justify-between"><div><h3 className="font-medium">{object.label}</h3><p className="text-xs text-muted-foreground">{object.name}</p></div><span className="text-xs text-muted-foreground">{permission.modifyAll ? "Manage all" : permission.viewAll ? "View all" : "Scoped access"}</span></div><div className="grid gap-3 sm:grid-cols-3 md:grid-cols-6">{[["Create", "canCreate"], ["Read", "canRead"], ["Edit", "canUpdate"], ["Delete", "canDelete"], ["View All", "viewAll"], ["Manage All", "modifyAll"]].map(([label, key]) => <label key={key} className="flex items-center gap-2 text-sm"><input type="checkbox" checked={Boolean(permission[key as keyof ObjectPermission])} onChange={(event) => updateObject(object.id, { [key]: event.target.checked })} />{label}</label>)}</div></div>; })}</div>;
   if (tab === "records") return <div className="space-y-3">{modules.map((module) => <div key={module} className="flex items-center justify-between rounded-lg border p-4"><div><p className="font-medium">{module}</p><p className="text-xs text-muted-foreground">Which records this profile can access</p></div><select value={security.recordAccess[module] || "OWN"} onChange={(event) => setSecurity((current) => current ? { ...current, recordAccess: { ...current.recordAccess, [module]: event.target.value as Scope } } : current)} className="h-9 rounded-md border bg-background px-3 text-sm"><option value="OWN">Own records</option><option value="TEAM">Team records</option><option value="ALL">All records</option></select></div>)}</div>;
-  return <div className="space-y-4">{systemPermissions.map((permission) => <label key={permission.id} className="flex items-center justify-between rounded-lg border p-4"><div><p className="font-medium">{permission.label}</p><p className="text-xs text-muted-foreground">{permission.module} / {permission.action}</p></div><input type="checkbox" checked={security.permissions.some((item) => item.id === permission.id)} onChange={() => toggleSystemPermission(permission.id)} /></label>)}</div>;
+  if (tab === "permission-sets") return <div className="space-y-4">
+    <div>
+      <h3 className="font-medium">Permission Sets assigned to this Profile</h3>
+      <p className="text-sm text-muted-foreground">All active users assigned to this profile inherit the selected Permission Sets.</p>
+    </div>
+    {security.permissionSets.length ? security.permissionSets.map((permissionSet) => <label key={permissionSet.id} className="flex items-center justify-between gap-4 rounded-lg border p-4">
+      <div>
+        <p className="font-medium">{permissionSet.name}</p>
+        <p className="text-xs text-muted-foreground">{permissionSet.description || "No description"}</p>
+      </div>
+      <input
+        type="checkbox"
+        checked={security.permissionSetIds.includes(permissionSet.id)}
+        onChange={(event) => setSecurity((current) => {
+          if (!current) return current;
+          const permissionSetIds = event.target.checked
+            ? [...new Set([...current.permissionSetIds, permissionSet.id])]
+            : current.permissionSetIds.filter((id) => id !== permissionSet.id);
+          return { ...current, permissionSetIds };
+        })}
+        aria-label={`Assign ${permissionSet.name} to this profile`}
+      />
+    </label>) : <p className="rounded-lg border border-dashed p-6 text-sm text-muted-foreground">No active Permission Sets are available for this company. Create one in Permission Sets first.</p>}
+  </div>;
+  if (tab === "sidebar") return <section className="space-y-3">
+    <div>
+      <h3 className="font-medium">Sidebar Access</h3>
+      <p className="text-sm text-muted-foreground">Choose which navigation sections users assigned to this profile can see.</p>
+    </div>
+    <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+      {CRM_SIDEBAR_ITEMS.map((item) => {
+        const required = item.id === "home" || (security.profile.isAdmin && item.id === "setup");
+        return <label key={item.id} className="flex items-center gap-2 rounded-lg border p-3 text-sm">
+          <input
+            type="checkbox"
+            checked={sidebarAccess.includes(item.id)}
+            disabled={required}
+            onChange={(event) => setSecurity((current) => {
+              if (!current) return current;
+              const currentAccess = current.sidebarAccess ?? CRM_SIDEBAR_ITEMS.map(({ id }) => id);
+              const nextAccess = event.target.checked
+                ? [...currentAccess, item.id]
+                : currentAccess.filter((id) => id !== item.id);
+              return { ...current, sidebarAccess: nextAccess };
+            })}
+          />
+          {item.label}{required && <span className="text-xs text-muted-foreground">(required)</span>}
+        </label>;
+      })}
+    </div>
+  </section>;
+  return <div className="space-y-6">
+    <section className="space-y-3">
+      <h3 className="font-medium">Reports, Dashboards & System Permissions</h3>
+      {systemPermissions.map((permission) => <label key={permission.id} className="flex items-center justify-between rounded-lg border p-4"><div><p className="font-medium">{permission.label}</p><p className="text-xs text-muted-foreground">{permission.module} / {permission.action}</p></div><input type="checkbox" checked={security.permissions.some((item) => item.id === permission.id)} onChange={() => toggleSystemPermission(permission.id)} /></label>)}
+    </section>
+  </div>;
 }
 
 function Summary({ title, value }: { title: string; value: string }) { return <div className="rounded-lg border p-5"><p className="text-sm text-muted-foreground">{title}</p><p className="mt-2 text-xl font-semibold">{value}</p></div>; }

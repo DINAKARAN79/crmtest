@@ -34,16 +34,11 @@ const SOURCE_OPTIONS = [
   { label: "Walk-in", value: "WALK_IN" },
 ];
 
-function mapApiLeadToLead(apiLead: any, maskNumbers: boolean, bookedBucketView = false): Lead {
+function mapApiLeadToLead(apiLead: any, maskNumbers: boolean): Lead {
   const statusLower = (apiLead.status || "NEW").toLowerCase();
   const ownerName = apiLead.owner
     ? [apiLead.owner.firstName, apiLead.owner.lastName].filter(Boolean).join(" ")
     : "";
-  const bookedByName = apiLead.bookedBy
-    ? [apiLead.bookedBy.firstName, apiLead.bookedBy.lastName].filter(Boolean).join(" ")
-    : apiLead.bookings?.[0]?.owner
-      ? [apiLead.bookings[0].owner.firstName, apiLead.bookings[0].owner.lastName].filter(Boolean).join(" ")
-      : "";
   return {
     id: apiLead.id,
     leadNumber: apiLead.leadNumber || "",
@@ -59,14 +54,10 @@ function mapApiLeadToLead(apiLead: any, maskNumbers: boolean, bookedBucketView =
     status: statusLower,
     statusLabel: apiLead.statusLabel || statusLower.replaceAll("_", " "),
     rating: apiLead.rating || "",
-    assignedTo: bookedBucketView
-      ? ownerName
-      : statusLower === "booked"
+    assignedTo: statusLower === "booked"
       ? "Booked"
       : ownerName,
-    bookedBy: bookedByName,
     projectName: apiLead.project?.name || "",
-    bookedAt: apiLead.bookings?.[0]?.createdAt || "",
     createdAt: apiLead.createdAt,
     updatedAt: apiLead.updatedAt,
   };
@@ -91,19 +82,6 @@ export default function LeadsPage() {
   const [sourceFilter, setSourceFilter] = React.useState("");
   const [dateFrom, setDateFrom] = React.useState("");
   const [dateTo, setDateTo] = React.useState("");
-  const [canViewBookedBucket, setCanViewBookedBucket] = React.useState(false);
-  const [bookedBucketView, setBookedBucketView] = React.useState(false);
-
-  React.useEffect(() => {
-    if (!user?.id) return;
-    leadApi.bookedBucketAccess()
-      .then((response) => setCanViewBookedBucket(Boolean(response.data.data?.canView)))
-      .catch((error: unknown) => {
-        console.error("Failed to load Booked Bucket access:", error);
-        toast({ title: "Unable to check Booked Bucket access", variant: "destructive" });
-      });
-  }, [toast, user?.id]);
-
   React.useEffect(() => {
     const timer = setTimeout(() => {
       setDebouncedSearch(search);
@@ -150,7 +128,6 @@ export default function LeadsPage() {
         page: currentPage,
         limit: 20,
       };
-      if (bookedBucketView) params.bookedBucket = "true";
       if (debouncedSearch) params.search = debouncedSearch;
       if (statusFilter) params.status = statusFilter;
       if (sourceFilter) params.source = sourceFilter;
@@ -162,7 +139,7 @@ export default function LeadsPage() {
         const items = Array.isArray(res.data.data)
           ? res.data.data
           : res.data.data.leads || [];
-        setLeads(items.map((item: any) => mapApiLeadToLead(item, maskNumbers, bookedBucketView)));
+        setLeads(items.map((item: any) => mapApiLeadToLead(item, maskNumbers)));
         setTotalItems(res.data.pagination?.total || items.length);
       } else {
         setError(res.data.error || "Failed to load leads");
@@ -172,7 +149,7 @@ export default function LeadsPage() {
     } finally {
       setIsLoading(false);
     }
-  }, [currentPage, debouncedSearch, statusFilter, sourceFilter, dateFrom, dateTo, listViews.ready, listViews.queryKey, maskNumbers, bookedBucketView]);
+  }, [currentPage, debouncedSearch, statusFilter, sourceFilter, dateFrom, dateTo, listViews.ready, listViews.queryKey, maskNumbers]);
 
   React.useEffect(() => {
     fetchLeads();
@@ -209,14 +186,6 @@ export default function LeadsPage() {
         view={listViews.control}
         actions={(
           <div className="flex flex-wrap gap-2">
-            {canViewBookedBucket && (
-              <Button type="button" variant={bookedBucketView ? "default" : "outline"} onClick={() => {
-                setBookedBucketView((current) => !current);
-                setCurrentPage(1);
-              }}>
-                {bookedBucketView ? "All Leads" : "Booked Bucket"}
-              </Button>
-            )}
             {canCreateLead && (
               <Button className={`${listPageActionClassName} bg-gradient-to-r from-blue-600 to-blue-500 text-white shadow-sm shadow-blue-200 hover:from-blue-700 hover:to-blue-600`} onClick={() => router.push("/leads/new")}>
                 <Plus className="h-4 w-4" />
@@ -327,7 +296,6 @@ export default function LeadsPage() {
 
       <LeadList
         leads={leads}
-        bookedBucketView={bookedBucketView}
         isLoading={isLoading}
         totalItems={totalItems}
         currentPage={currentPage}

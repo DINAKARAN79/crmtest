@@ -24,6 +24,7 @@ const database = vi.hoisted(() => ({
   pageLayoutUpdate: vi.fn(),
   auditLogCreate: vi.fn(),
   auditLogFindFirst: vi.fn(),
+  userFindUnique: vi.fn(),
   sequenceUpsert: vi.fn(),
   transaction: vi.fn(),
 }));
@@ -65,6 +66,7 @@ vi.mock('@dct-crm/db', () => ({
     },
     auditLog: { findFirst: database.auditLogFindFirst },
     project: { findFirst: database.projectFindFirst },
+    user: { findUnique: database.userFindUnique },
     $transaction: database.transaction,
   },
 }));
@@ -107,6 +109,7 @@ vi.mock('../services/ownerHistory', () => ({
 
 vi.mock('../services/recordAccess', () => ({
   canAccessLead: vi.fn().mockResolvedValue(true),
+  canEditLead: vi.fn().mockResolvedValue(true),
   getLeadRecordScope: vi.fn(),
   leadScopeClause: vi.fn(),
 }));
@@ -131,7 +134,9 @@ vi.mock('../services/tenantTimezone', () => ({
 vi.mock('../services/rrQueue', () => ({
   findApplicableRRQueue: rrQueue.findApplicableRRQueue,
   assignLeadToProjectRoundRobinInTransaction: rrQueue.assignLeadInTransaction,
-  hasLeadAssignmentRelevantChanges: vi.fn(),
+  hasLeadAssignmentRelevantChanges: vi.fn((updateData: Record<string, unknown>) =>
+    ['status', 'ownerId', 'source'].some((field) => Object.prototype.hasOwnProperty.call(updateData, field)),
+  ),
   isLeadEligibleForAutoAssignment: () => true,
   RoundRobinAssignmentService: {
     assignLeadInTransaction: rrQueue.assignLeadInTransaction,
@@ -145,6 +150,19 @@ vi.mock('../services/leadOwnerChange', () => ({
 vi.mock('../services/leadNotes', () => ({
   appendLeadProcessNote: vi.fn().mockResolvedValue(undefined),
 }));
+vi.mock('../services/effectivePermissions', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../services/effectivePermissions')>();
+  return {
+    ...actual,
+    EffectivePermissionService: {
+      ...actual.EffectivePermissionService,
+      getEffectivePermissionsCached: vi.fn().mockResolvedValue([{ name: 'LEAD_UPDATE' }]),
+      hasPermissionIn: vi.fn((permissions: Array<{ name: string }>, permission: string) =>
+        permissions.some((item) => item.name === permission),
+      ),
+    },
+  };
+});
 
 import { leadRoutes as leadsRouter } from './leads';
 
@@ -174,6 +192,21 @@ async function pushLeadToSVC(body: Record<string, unknown>) {
   const address = server.address();
   if (!address || typeof address === 'string') throw new Error('Expected a TCP server address');
   return fetch(`http://127.0.0.1:${address.port}/api/leads/lead-a/push-to-svc`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+}
+
+async function moveLeadToRecovery(body: Record<string, unknown>) {
+  const app = express();
+  app.use(express.json());
+  app.use('/api/leads', leadsRouter);
+  const server = app.listen(0);
+  servers.push(server);
+  const address = server.address();
+  if (!address || typeof address === 'string') throw new Error('Expected a TCP server address');
+  return fetch(`http://127.0.0.1:${address.port}/api/leads/lead-a/move-to-recovery`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
@@ -246,6 +279,7 @@ beforeEach(() => {
   database.pageLayoutUpdate.mockResolvedValue({});
   database.auditLogCreate.mockResolvedValue({});
   database.auditLogFindFirst.mockResolvedValue(null);
+  database.userFindUnique.mockResolvedValue({ firstName: 'Pre Sales', lastName: 'User' });
   database.leadFindMany.mockResolvedValue([]);
   database.leadCount.mockResolvedValue(1);
   rrQueue.assignLeadInTransaction.mockResolvedValue({ assignedUserId: 'svc-member-a' });
@@ -561,6 +595,42 @@ describe('PUT /api/leads/:id owner protection', () => {
     expect(database.leadUpdate).not.toHaveBeenCalled();
     expect(database.transaction).not.toHaveBeenCalled();
   });
+
+  it('updates a project without running Round Robin or changing the owner', async () => {
+    database.leadUpdate.mockResolvedValueOnce({
+      id: 'lead-a',
+      tenantId: 'tenant-a',
+      ownerId: 'svc-a',
+      projectId: 'project-new',
+      status: 'PROSPECT',
+    });
+
+    const response = await updateLead({ projectId: 'project-new' });
+
+    expect(response.status).toBe(200);
+    expect(database.leadUpdate).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({ projectId: 'project-new' }),
+    }));
+    expect(rrQueue.findApplicableRRQueue).not.toHaveBeenCalled();
+    expect(rrQueue.assignLeadInTransaction).not.toHaveBeenCalled();
+  });
+
+  it('does not reassign when a project change is submitted with other editable fields', async () => {
+    database.leadUpdate.mockResolvedValueOnce({
+      id: 'lead-a',
+      tenantId: 'tenant-a',
+      ownerId: 'svc-a',
+      projectId: 'project-new',
+      status: 'PROSPECT',
+      source: 'WEBSITE',
+    });
+
+    const response = await updateLead({ projectId: 'project-new', source: 'WEBSITE' });
+
+    expect(response.status).toBe(200);
+    expect(rrQueue.findApplicableRRQueue).not.toHaveBeenCalled();
+    expect(rrQueue.assignLeadInTransaction).not.toHaveBeenCalled();
+  });
 });
 
 describe('POST /api/leads/:id/schedule-site-visit project validation', () => {
@@ -670,6 +740,48 @@ describe('POST /api/leads Round Robin assignment', () => {
         id: 'lead-new',
         assignmentWarning: expect.stringContaining('no eligible Sales user'),
       },
+    });
+  });
+
+  describe('POST /api/leads/:id/move-to-recovery', () => {
+    it('records the recovery date, reason, and acting user in the Unqualified fields', async () => {
+      database.leadFindFirst.mockResolvedValue({
+        id: 'lead-a',
+        tenantId: 'tenant-a',
+        ownerId: 'presales-a',
+        creatorId: 'presales-a',
+        status: 'PROSPECT',
+        projectId: 'project-a',
+        customFields: { existingField: 'keep me' },
+        owner: { id: 'presales-a', firstName: 'Pre Sales', lastName: 'User' },
+      });
+      database.leadFindUnique.mockResolvedValue({ id: 'lead-a', status: 'LOST' });
+
+      const response = await moveLeadToRecovery({
+        recoveryReason: 'Budget Issue',
+        note: 'Customer paused the purchase',
+      });
+
+      expect(response.status).toBe(200);
+      const updateData = database.leadUpdate.mock.calls[0][0].data;
+      expect(updateData).toMatchObject({
+        status: 'LOST',
+        customFields: {
+          existingField: 'keep me',
+          sf_Unqualified_Reason__c: 'Budget Issue',
+          sf_Unqualified_Lost_By__c: 'Pre Sales User',
+        },
+      });
+      expect(updateData.lostAt).toBeInstanceOf(Date);
+      expect(updateData.customFields.sf_Unqualified_Date__c).toBe(updateData.lostAt.toISOString());
+      expect(database.auditLogCreate).toHaveBeenCalledWith(expect.objectContaining({
+        data: expect.objectContaining({
+          newValues: expect.objectContaining({
+            Unqualified_Reason__c: 'Budget Issue',
+            Unqualified_Lost_By__c: 'Pre Sales User',
+          }),
+        }),
+      }));
     });
   });
 

@@ -18,7 +18,8 @@ import {
 function mockTransaction() {
   return {
     $queryRaw: vi.fn().mockResolvedValue([{ id: 'queue-1' }]),
-    siteVisit: { findFirst: vi.fn(), update: vi.fn() },
+    siteVisit: { findFirst: vi.fn(), update: vi.fn(), updateMany: vi.fn() },
+    followUp: { updateMany: vi.fn() },
     rRQueue: { findFirst: vi.fn(), findMany: vi.fn().mockResolvedValue([]), update: vi.fn() },
     rRQueueMember: { update: vi.fn() },
     lead: { findFirst: vi.fn(), update: vi.fn() },
@@ -80,6 +81,26 @@ const salesQueue = () => ({
     },
   }],
 });
+
+const preSalesQueue = () => {
+  const queue = salesQueue();
+  queue.id = 'presales-queue';
+  queue.members = [{
+    ...queue.members[0],
+    id: 'presales-member',
+    userId: 'presales-user',
+    userType: 'Pre Sales',
+    user: {
+      ...queue.members[0].user,
+      id: 'presales-user',
+      firstName: 'Pre Sales',
+      lastName: 'User',
+      email: 'presales@example.test',
+      profile: { name: 'Pre Sales' },
+    },
+  }];
+  return queue;
+};
 
 const svcQueue = () => {
   const queue = salesQueue();
@@ -485,6 +506,50 @@ describe('selectNextSequenceMember', () => {
     });
   });
 
+  it('assigns reopened leads using the Pre Sales member type, not the queue default', async () => {
+    const tx = mockTransaction();
+    const queue = preSalesQueue();
+    tx.rRQueue.findMany.mockResolvedValue([queue]);
+    tx.rRQueue.findFirst.mockResolvedValue(queue);
+    tx.rRQueue.update.mockResolvedValue({});
+    tx.rRQueueMember.update.mockResolvedValue({});
+    tx.lead.findFirst.mockResolvedValue({
+      id: 'lead-reopened',
+      tenantId: 'tenant-1',
+      projectId: 'project-1',
+      ownerId: 'old-owner',
+      status: 'NEW',
+      owner: { profile: { name: 'Admin' } },
+    });
+    tx.lead.update.mockResolvedValue({});
+    tx.rRQueueHistory.create.mockResolvedValue({});
+    tx.auditLog.create.mockResolvedValue({});
+
+    const assigned = await assignLeadToProjectRoundRobinInTransaction(tx, {
+      tenantId: 'tenant-1',
+      leadId: 'lead-reopened',
+      projectId: 'project-1',
+      userType: 'Pre Sales',
+      actorId: 'admin',
+      reason: 'Lost lead reopened and assigned to Pre Sales round robin',
+    });
+
+    expect(assigned).toMatchObject({
+      assignedUserId: 'presales-user',
+      queueId: 'presales-queue',
+    });
+    expect(tx.rRQueue.findMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: { tenantId: 'tenant-1', active: true, members: { some: { userType: 'Pre Sales' } } },
+    }));
+    expect(tx.lead.update).toHaveBeenCalledWith({
+      where: { id: 'lead-reopened' },
+      data: { ownerId: 'presales-user', rrQueueId: 'presales-queue' },
+    });
+    expect(tx.rRQueueHistory.create).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({ field: 'Pre Sales Owner', userId: 'presales-user' }),
+    }));
+  });
+
   it('marks the lead booked when MIS approval asks for that status', async () => {
     const tx = mockTransaction();
     const queue = salesQueue();
@@ -698,7 +763,7 @@ describe('selectNextSequenceMember', () => {
       expect(hasLeadAssignmentRelevantChanges({ lastName: 'Updated' })).toBe(false);
       expect(hasLeadAssignmentRelevantChanges({ status: 'PROSPECT' })).toBe(true);
       expect(hasLeadAssignmentRelevantChanges({ ownerId: null })).toBe(true);
-      expect(hasLeadAssignmentRelevantChanges({ projectId: null })).toBe(true);
+      expect(hasLeadAssignmentRelevantChanges({ projectId: null })).toBe(false);
       expect(hasLeadAssignmentRelevantChanges({ source: 'WEBSITE' })).toBe(true);
     });
   });

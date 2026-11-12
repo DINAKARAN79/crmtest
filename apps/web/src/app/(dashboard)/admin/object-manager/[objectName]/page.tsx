@@ -54,9 +54,6 @@ import {
   Settings,
   Shield,
   Layout,
-  List,
-  GitBranch,
-  Zap,
   Search,
   ArrowUpDown,
   ChevronUp,
@@ -69,7 +66,7 @@ import {
   Check,
 } from "lucide-react";
 import Link from "next/link";
-import { objectManagerApi } from "@/lib/api";
+import { objectManagerApi, profileApi } from "@/lib/api";
 
 const FIELD_TYPES = [
   { value: "text", label: "Text", category: "Text" },
@@ -182,7 +179,7 @@ export default function ObjectSettingsPage() {
 
   const [object, setObject] = React.useState<any>(null);
   const [fields, setFields] = React.useState<FieldDef[]>([]);
-  const [roles, setRoles] = React.useState<any[]>([]);
+  const [profiles, setProfiles] = React.useState<any[]>([]);
   const [permissions, setPermissions] = React.useState<any[]>([]);
   const [isLoading, setIsLoading] = React.useState(true);
   const [searchQuery, setSearchQuery] = React.useState("");
@@ -204,15 +201,15 @@ export default function ObjectSettingsPage() {
   const loadData = async () => {
     setIsLoading(true);
     try {
-      const [objRes, fieldsRes, rolesRes, permsRes] = await Promise.all([
+      const [objRes, fieldsRes, profilesRes, permsRes] = await Promise.all([
         objectManagerApi.getObject(objectName),
         objectManagerApi.listFields(objectName, { includeSystem: true, includeInactive: true }),
-        import("@/lib/api").then((m) => m.roleApi.list()),
+        profileApi.list({ limit: 1000 }),
         objectManagerApi.getObjectPermissions(objectName),
       ]);
       setObject(objRes.data.data);
       setFields(fieldsRes.data.data || []);
-      setRoles(rolesRes.data.data || []);
+      setProfiles(profilesRes.data.data || []);
       setPermissions(permsRes.data.data || []);
     } catch (error) {
       console.error("Failed to load data:", error);
@@ -512,18 +509,6 @@ export default function ObjectSettingsPage() {
             <Layout className="h-4 w-4" />
             Layouts
           </TabsTrigger>
-          <TabsTrigger value="listViews" className="gap-2">
-            <List className="h-4 w-4" />
-            List Views
-          </TabsTrigger>
-          <TabsTrigger value="related" className="gap-2">
-            <GitBranch className="h-4 w-4" />
-            Related
-          </TabsTrigger>
-          <TabsTrigger value="automation" className="gap-2">
-            <Zap className="h-4 w-4" />
-            Automation
-          </TabsTrigger>
         </TabsList>
 
         <TabsContent value="fields" className="space-y-4">
@@ -693,13 +678,13 @@ export default function ObjectSettingsPage() {
         <TabsContent value="permissions" className="space-y-4">
           <Card>
             <CardHeader>
-              <CardTitle>Role-Based Object Permissions</CardTitle>
+              <CardTitle>CRM Profile Object Permissions</CardTitle>
             </CardHeader>
             <CardContent>
               <Table>
                 <TableHeader>
                   <TableRow>
-                    <TableHead>Role</TableHead>
+                    <TableHead>CRM Profile</TableHead>
                     <TableHead className="text-center">Create</TableHead>
                     <TableHead className="text-center">Read</TableHead>
                     <TableHead className="text-center">Update</TableHead>
@@ -707,21 +692,23 @@ export default function ObjectSettingsPage() {
                   </TableRow>
                 </TableHeader>
                 <TableBody>
-                  {roles.map((role) => {
-                    const perm = permissions.find((p) => p.roleId === role.id);
+                  {profiles.map((profile) => {
+                    const perm = permissions.find((p) => p.profileId === profile.id);
                     return (
-                      <TableRow key={role.id}>
-                        <TableCell className="font-medium">{role.name}</TableCell>
+                      <TableRow key={profile.id}>
+                        <TableCell className="font-medium">{profile.name}</TableCell>
                         {["canCreate", "canRead", "canUpdate", "canDelete"].map((permKey) => (
                           <TableCell key={permKey} className="text-center">
                             <Switch
                               checked={(perm as any)?.[permKey] || false}
                               onCheckedChange={(v: boolean) => {
-                                const existing = permissions.find((p) => p.roleId === role.id);
+                                const existing = permissions.find((p) => p.profileId === profile.id);
                                 const data = existing
-                                  ? { roleId: role.id, ...existing, [permKey]: v }
-                                  : { roleId: role.id, canCreate: permKey === "canCreate" ? v : false, canRead: permKey === "canRead" ? v : true, canUpdate: permKey === "canUpdate" ? v : false, canDelete: permKey === "canDelete" ? v : false };
-                                objectManagerApi.setObjectPermissions(objectName, data).then(() => loadData());
+                                  ? { profileId: profile.id, ...existing, [permKey]: v }
+                                  : { profileId: profile.id, canCreate: permKey === "canCreate" ? v : false, canRead: permKey === "canRead" ? v : false, canUpdate: permKey === "canUpdate" ? v : false, canDelete: permKey === "canDelete" ? v : false };
+                                objectManagerApi.setObjectPermissions(objectName, data)
+                                  .then(() => loadData())
+                                  .catch((error) => console.error("Failed to save profile object permission:", error));
                               }}
                             />
                           </TableCell>
@@ -739,44 +726,6 @@ export default function ObjectSettingsPage() {
           <LayoutManager objectName={objectName} fields={fields} />
         </TabsContent>
 
-        <TabsContent value="listViews" className="space-y-4">
-          <Card>
-            <CardHeader>
-              <CardTitle>List Views</CardTitle>
-            </CardHeader>
-            <CardContent>
-              <p className="text-sm text-muted-foreground">
-                Configure which fields appear in list views, default sorting, and filters.
-              </p>
-            </CardContent>
-          </Card>
-        </TabsContent>
-
-        <TabsContent value="related" className="space-y-4">
-          <Card>
-            <CardHeader>
-              <CardTitle>Related Objects</CardTitle>
-            </CardHeader>
-            <CardContent>
-              <p className="text-sm text-muted-foreground">
-                Manage relationships between this object and other CRM objects.
-              </p>
-            </CardContent>
-          </Card>
-        </TabsContent>
-
-        <TabsContent value="automation" className="space-y-4">
-          <Card>
-            <CardHeader>
-              <CardTitle>Automation Rules</CardTitle>
-            </CardHeader>
-            <CardContent>
-              <p className="text-sm text-muted-foreground">
-                Set up automated workflows, field updates, and notifications.
-              </p>
-            </CardContent>
-          </Card>
-        </TabsContent>
       </Tabs>
 
       {/* CREATE/EDIT FIELD DIALOG */}

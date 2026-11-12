@@ -9,10 +9,10 @@ import { getNextSiteVisitNumber } from '../services/leadWorkflowExtras';
 import { assignCompletedSiteVisitToSalesInTransaction } from '../services/rrQueue';
 import { coordinatesFromStoredMapUrl } from '../services/projectLocation';
 import { GRE_LOCATION_MESSAGES, readStoredCoordinate, verifyGreSubmissionLocation } from '../services/siteVisitLocation';
-import { crmDateRangeBounds, crmLocalDateTimeToDate, leadStatusFromId, SITE_VISIT_TYPE_OPTIONS } from '@dct-crm/shared';
+import { crmDateRangeBounds, crmDateTimeInputValue, crmLocalDateTimeToDate, leadStatusFromId, SITE_VISIT_TYPE_OPTIONS } from '@dct-crm/shared';
 import { decorateLeadStatus, decorateLeadStatuses } from '../services/leadStatusSettings';
 import { createEnquiryInTransactionWithStatus } from '../services/enquiryService';
-import { mergeOperationalLeadCustomFields } from '../services/leadEventTagging';
+import { isConfiguredLostStatus, mergeOperationalLeadCustomFields } from '../services/leadEventTagging';
 import {
   acquireLeadDuplicateLocks,
   findLeadDuplicates,
@@ -123,7 +123,15 @@ export const submissionsQuerySchema = z.object({
   projectId: z.string().trim().min(1).max(100).optional(),
 });
 
-export function getGreLeadStatus(_hasCompletedSiteVisit: boolean, existingStatus?: LeadStatus): LeadStatus {
+export function getGreLeadStatus(hasCompletedSiteVisit: boolean, existingStatus?: LeadStatus): LeadStatus {
+  if (hasCompletedSiteVisit && !existingStatus) return LeadStatus.SITE_VISIT_HAPPENED;
+  if (
+    hasCompletedSiteVisit
+    && existingStatus
+    && ['NEW', 'INCOMING', 'PROSPECT', 'SITE_VISIT_SCHEDULED'].includes(existingStatus)
+  ) {
+    return LeadStatus.SITE_VISIT_HAPPENED;
+  }
   return existingStatus ?? LeadStatus.NEW;
 }
 
@@ -214,11 +222,32 @@ export function normalizeStoredPhone(value: string | null, countryCode: string |
   return null;
 }
 
-export function greRegistrationLeadType(existingLead: boolean, value?: string | null): 'ORIGINAL' | 'RE_ENGAGED' {
+export function greRegistrationLeadType(
+  existingLead: boolean,
+  value?: string | null,
+  hasActiveScheduledSiteVisit = false,
+): 'ORIGINAL' | 'ADDITIONAL' | 'RE_ENGAGED' {
   const normalized = String(value || '').trim().toUpperCase().replace(/[\s-]+/g, '_');
+  if (existingLead && hasActiveScheduledSiteVisit) return 'ADDITIONAL';
   if (normalized === 'RE_ENGAGED' || normalized === 'REENGAGED') return 'RE_ENGAGED';
   if (normalized === 'ORIGINAL' || normalized === 'FRESH') return 'ORIGINAL';
   return existingLead ? 'RE_ENGAGED' : 'ORIGINAL';
+}
+
+export function hasActiveGreSiteVisit(
+  lead: { status: string; scheduledSiteVisits: unknown[] } | null | undefined,
+): boolean {
+  return Boolean(
+    lead?.scheduledSiteVisits.length &&
+    lead.status !== 'LOST' &&
+    !isConfiguredLostStatus(lead.status),
+  );
+}
+
+export function shouldCreateGreRelatedSource(
+  lead: { status: string; scheduledSiteVisits: unknown[] } | null | undefined,
+): boolean {
+  return !hasActiveGreSiteVisit(lead);
 }
 
 export function greVisitType(value?: string | null): (typeof SITE_VISIT_TYPE_OPTIONS)[number] | undefined {
@@ -336,6 +365,20 @@ function parseLocalDateTime(dateValue: string, timeValue: string, timeZone?: str
   const [hours, minutes] = timeValue.split(':').map(Number);
   if (hours > 23 || minutes > 59) return null;
   return crmLocalDateTimeToDate(dateValue, timeValue, timeZone || undefined);
+}
+
+export function parseGreSiteVisitDateTime(
+  dateValue: string,
+  timeValue: string,
+  timeZone?: string | null,
+  now = new Date(),
+): Date | null {
+  const parsed = parseLocalDateTime(dateValue, timeValue, timeZone);
+  if (!parsed) return null;
+
+  const submittedLocalDateTime = `${dateValue}T${timeValue}`;
+  const currentLocalDateTime = crmDateTimeInputValue(now, timeZone || undefined);
+  return submittedLocalDateTime <= currentLocalDateTime ? parsed : null;
 }
 
 async function getActiveForm(token: string) {
@@ -595,9 +638,9 @@ publicRouter.post('/:token/submit', async (req, res) => {
     const firstName = draft.lead.firstName?.trim() || '';
     const lastName = draft.lead.lastName?.trim() || '';
     const siteVisitAt = draft.siteVisit.required
-      ? parseLocalDateTime(draft.siteVisit.date!, draft.siteVisit.time!, context.form.tenant.timezone)
+      ? parseGreSiteVisitDateTime(draft.siteVisit.date!, draft.siteVisit.time!, context.form.tenant.timezone)
       : null;
-    if (!siteVisitAt || siteVisitAt > new Date()) {
+    if (!siteVisitAt) {
       return res.status(400).json({ success: false, error: 'Site visit date and time must be valid and cannot be in the future' });
     }
     if (draft.lead.projectId) {
@@ -719,6 +762,7 @@ publicRouter.post('/:token/submit', async (req, res) => {
         throw Object.assign(new Error('We could not safely match this number to one CRM record. Please contact the team that shared this form.'), { statusCode: 409 });
       }
       const existingLead = matchingLeads[0] ?? null;
+      const createRelatedSource = shouldCreateGreRelatedSource(existingLead);
       if (!existingLead && !lastName) {
         throw Object.assign(new Error('Last name is required'), { statusCode: 400 });
       }
@@ -815,7 +859,7 @@ publicRouter.post('/:token/submit', async (req, res) => {
 
       let lead: { id: string; leadNumber: string | null };
       const persistedLeadStatus = getGreLeadStatus(draft.siteVisit.required, existingLead?.status);
-      const leadStatusChanged = false;
+      const leadStatusChanged = Boolean(existingLead && existingLead.status !== persistedLeadStatus);
       submitStage = 'saving lead';
       if (existingLead) {
         lead = { id: existingLead.id, leadNumber: null };
@@ -940,6 +984,28 @@ publicRouter.post('/:token/submit', async (req, res) => {
         },
         select: siteVisitSelect,
       });
+      if (existingLead && leadStatusChanged) {
+        await tx.lead.update({
+          where: { id: lead.id },
+          data: { status: persistedLeadStatus },
+        });
+        await tx.auditLog.create({
+          data: {
+            tenantId: context.form.tenantId,
+            userId: context.form.createdById,
+            leadId: lead.id,
+            action: 'STATUS_CHANGE',
+            objectType: 'Lead',
+            objectId: lead.id,
+            oldValues: { status: existingLead.status },
+            newValues: {
+              status: persistedLeadStatus,
+              siteVisitId: siteVisit.id,
+              reason: 'GRE site visit completed',
+            },
+          },
+        });
+      }
       submitStage = 'assigning completed site visit';
       const salesHandoff = draft.siteVisit.required
         ? await assignCompletedSiteVisitToSalesInTransaction(tx, siteVisit.id, context.form.tenantId)
@@ -966,11 +1032,20 @@ publicRouter.post('/:token/submit', async (req, res) => {
         },
       });
 
-      const relatedSourceResult = await createEnquiryInTransactionWithStatus(tx, {
+      const relatedSourceResult = createRelatedSource
+        ? await createEnquiryInTransactionWithStatus(tx, {
         tenantId: context.form.tenantId,
         leadId: lead.id,
-        leadType: greRegistrationLeadType(Boolean(existingLead), draft.lead.leadType),
-        enquiryType: greRegistrationLeadType(Boolean(existingLead), draft.lead.leadType),
+        leadType: greRegistrationLeadType(
+          Boolean(existingLead),
+          draft.lead.leadType,
+          hasActiveGreSiteVisit(existingLead),
+        ),
+        enquiryType: greRegistrationLeadType(
+          Boolean(existingLead),
+          draft.lead.leadType,
+          hasActiveGreSiteVisit(existingLead),
+        ),
         source: 'GRE',
         subSource: draft.lead.leadSubSource,
         campaign: draft.lead.campaign,
@@ -1000,9 +1075,9 @@ publicRouter.post('/:token/submit', async (req, res) => {
           previousLeadStatus: existingLead?.status || null,
         },
         userId: context.form.createdById,
-      });
-      const relatedSource = relatedSourceResult.enquiry;
-      if (relatedSourceResult.created) {
+      })
+        : null;
+      if (relatedSourceResult?.created) {
         const currentAttribution = await tx.lead.findUnique({
           where: { id: lead.id },
           select: { firstCampaign: true },
@@ -1021,7 +1096,7 @@ publicRouter.post('/:token/submit', async (req, res) => {
           },
         });
       }
-      if (existingLead) {
+      if (existingLead && relatedSourceResult) {
         await tx.auditLog.create({
           data: {
             tenantId: context.form.tenantId,
@@ -1029,10 +1104,10 @@ publicRouter.post('/:token/submit', async (req, res) => {
             leadId: lead.id,
             action: 'DUPLICATE_ENQUIRY_LINKED',
             objectType: 'Enquiry',
-            objectId: relatedSource.id,
+            objectId: relatedSourceResult.enquiry.id,
             newValues: {
               leadId: lead.id,
-              enquiryId: relatedSource.id,
+              enquiryId: relatedSourceResult.enquiry.id,
               matchingFields: existingLead.duplicateMatchFields,
               source: 'GRE',
               projectId: selectedProjectId,

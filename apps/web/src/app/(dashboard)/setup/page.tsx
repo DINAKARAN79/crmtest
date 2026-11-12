@@ -17,7 +17,6 @@ import {
   Settings,
   ShieldCheck,
   Users,
-  Archive,
 } from "lucide-react";
 import { companyApi } from "@/lib/api";
 import { useAuth } from "@/contexts/auth-context";
@@ -55,7 +54,6 @@ const groups = [
     description: "Shape CRM data and user experiences.",
     items: [
       { label: "Round Robins", href: "/setup/customization/rrqueues", icon: GitBranch },
-      { label: "Booked Bucket", href: "/setup/customization/booked-bucket", icon: Archive },
       { label: "Object Manager", href: "/admin/object-manager", icon: Boxes },
     ],
   },

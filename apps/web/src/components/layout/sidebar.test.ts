@@ -29,6 +29,20 @@ describe('getNavigationByProfile', () => {
     expect(salesNav.some((item) => item.href === '/mis-approvals')).toBe(false);
   });
 
+  it('filters configured sidebar items while preserving Home', () => {
+    const nav = getNavigationByProfile('Presales', [], (perm) => perm === 'LEAD_READ', false, false, ['leads']);
+
+    expect(nav.map((item) => item.href)).toEqual(['/home', '/leads']);
+  });
+
+  it('filters administrator navigation and ignores settings for superadmins', () => {
+    const adminNav = getNavigationByProfile('Admin', [], () => false, false, true, ['home']);
+    const superAdminNav = getNavigationByProfile(undefined, [], () => false, true, true, ['home']);
+
+    expect(adminNav.some((item) => item.href === '/setup')).toBe(false);
+    expect(superAdminNav.some((item) => item.href === '/admin/companies')).toBe(true);
+  });
+
 });
 
 describe('role-based sidebar matrix', () => {

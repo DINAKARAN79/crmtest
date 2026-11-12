@@ -182,6 +182,7 @@ export const createApp = () => {
   mountExternalApi(app, '/api/records', dynamicCrudRouter);
   app.use('/api/permissions', permissionCatalogRouter);
   app.use('/api/new-permission-sets', newPermissionSetRouter);
+  app.use('/api/permission-sets', newPermissionSetRouter);
   app.use('/api/user-permissions', userPermissionRouter);
   app.use('/api/permission-set-groups', permissionSetGroupRoutes);
   app.use('/api/user-permission-set-groups', userPermissionSetGroupRoutes);

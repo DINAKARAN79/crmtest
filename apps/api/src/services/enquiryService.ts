@@ -36,6 +36,7 @@ export interface CreateEnquiryInput {
   ownerId?: string | null;
   enquiryDate?: Date;
   userId: string;
+  skipSourceDeduplication?: boolean;
 }
 
 function inferCountryCode(phone: string | null | undefined): string | null {
@@ -86,7 +87,7 @@ export async function createEnquiryInTransactionWithStatus(
     : null;
   if (existingSubmission) return { enquiry: existingSubmission, created: false };
 
-  const existingSources = input.originalSubmissionId
+  const existingSources = input.originalSubmissionId || input.skipSourceDeduplication
     ? []
     : await db.enquiry.findMany({
         where: {

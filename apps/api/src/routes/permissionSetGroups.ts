@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { prisma } from '@dct-crm/db';
 import { authenticate, AuthRequest } from '../middleware/auth';
 import { requirePermission } from '../middleware/permissions';
+import { EffectivePermissionService } from '../services/effectivePermissions';
 
 const router = Router();
 router.use(authenticate);
@@ -12,6 +13,15 @@ const groupSchema = z.object({
   description: z.string().optional(),
   isActive: z.boolean().optional(),
 });
+
+async function invalidateGroupUsers(groupIds: string[]) {
+  if (!groupIds.length) return;
+  const assignments = await prisma.userPermissionSetGroup.findMany({
+    where: { groupId: { in: groupIds } },
+    select: { userId: true },
+  });
+  EffectivePermissionService.invalidateUserPermissionsCache(assignments.map(({ userId }) => userId));
+}
 
 router.get('/', requirePermission('PERMISSION_SET_READ'), async (req: AuthRequest, res: Response) => {
   try {
@@ -72,6 +82,7 @@ router.put('/:id', requirePermission('PERMISSION_SET_UPDATE'), async (req: AuthR
       if (duplicate) return res.status(409).json({ success: false, error: 'Permission Set Group with this name already exists' });
     }
     const group = await prisma.permissionSetGroup.update({ where: { id: req.params.id }, data });
+    await invalidateGroupUsers([group.id]);
     res.json({ success: true, data: group });
   } catch (error: any) {
     if (error instanceof z.ZodError) return res.status(400).json({ success: false, error: error.issues[0]?.message });
@@ -104,6 +115,7 @@ router.post('/:id/permission-sets', requirePermission('PERMISSION_SET_UPDATE'), 
     const validCount = await prisma.newPermissionSet.count({ where: { id: { in: permissionSetIds }, tenantId: req.tenantId!, isActive: true } });
     if (validCount !== permissionSetIds.length) return res.status(422).json({ success: false, error: 'One or more permission sets are invalid' });
     await prisma.permissionSetGroupItem.createMany({ data: permissionSetIds.map((permissionSetId) => ({ groupId: group.id, permissionSetId })), skipDuplicates: true });
+    await invalidateGroupUsers([group.id]);
     res.json({ success: true, data: { assigned: permissionSetIds.length } });
   } catch (error) {
     console.error('Assign permission sets to group error:', error);
@@ -117,6 +129,7 @@ router.delete('/:id/permission-sets/:permissionSetId', requirePermission('PERMIS
     if (!group) return res.status(404).json({ success: false, error: 'Permission Set Group not found' });
     const deleted = await prisma.permissionSetGroupItem.deleteMany({ where: { groupId: group.id, permissionSetId: req.params.permissionSetId } });
     if (!deleted.count) return res.status(404).json({ success: false, error: 'Permission Set is not assigned to this group' });
+    await invalidateGroupUsers([group.id]);
     res.json({ success: true, message: 'Permission Set removed from group' });
   } catch (error) {
     console.error('Remove permission set from group error:', error);
@@ -152,6 +165,7 @@ userGroupRouter.post('/:userId', requirePermission('PERMISSION_SET_ASSIGN'), asy
     const validCount = await prisma.permissionSetGroup.count({ where: { id: { in: groupIds }, tenantId: req.tenantId!, isActive: true } });
     if (validCount !== groupIds.length) return res.status(422).json({ success: false, error: 'One or more permission set groups are invalid' });
     await prisma.userPermissionSetGroup.createMany({ data: groupIds.map((groupId) => ({ userId: user.id, groupId })), skipDuplicates: true });
+    EffectivePermissionService.invalidateUserPermissionsCache([user.id]);
     res.json({ success: true, data: { assigned: groupIds.length } });
   } catch (error) {
     console.error('Assign user permission set groups error:', error);
@@ -165,6 +179,7 @@ userGroupRouter.delete('/:userId/:groupId', requirePermission('PERMISSION_SET_AS
     if (!user) return res.status(404).json({ success: false, error: 'User not found' });
     const deleted = await prisma.userPermissionSetGroup.deleteMany({ where: { userId: user.id, groupId: req.params.groupId, group: { tenantId: req.tenantId! } } });
     if (!deleted.count) return res.status(404).json({ success: false, error: 'Group assignment not found' });
+    EffectivePermissionService.invalidateUserPermissionsCache([user.id]);
     res.json({ success: true, message: 'Permission Set Group unassigned successfully' });
   } catch (error) {
     console.error('Unassign user permission set group error:', error);
