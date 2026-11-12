@@ -1661,8 +1661,9 @@ export default function LeadDetailPage() {
     }
 
     const leadStatus = String(status).trim().toUpperCase();
-    const presalesCanCreateVisit = isPresalesProfile && (leadStatus === "NEW" || leadStatus === "INCOMING" || leadStatus === "PROSPECT");
-    if (presalesCanCreateVisit || (leadStatus === "PROSPECT" && (prof === "SVC" || prof === "Sales Executive" || adminLike))) {
+    const presalesCanCreateVisit = isPresalesProfile && (leadStatus === "NEW" || leadStatus === "INCOMING" || leadStatus === "PROSPECT" || leadStatus === "SITE_VISIT_HAPPENED");
+    const eligibleVisitStatus = leadStatus === "PROSPECT" || leadStatus === "SITE_VISIT_HAPPENED";
+    if (presalesCanCreateVisit || (eligibleVisitStatus && (prof === "SVC" || prof === "Sales Executive" || adminLike))) {
       actions.push({ label: "Schedule Site Visit", onClick: () => setSiteVisitDialogOpen(true), variant: "default" });
     }
 

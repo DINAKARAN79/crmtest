@@ -669,17 +669,37 @@ describe('selectNextSequenceMember', () => {
       expect(tx.lead.update).not.toHaveBeenCalled();
     });
 
-    it('assigns only to the Sales queue matching the completed visit project', async () => {
+    it('assigns to the project Sales queue even when intake criteria differ from the completed visit', async () => {
       const tx = mockTransaction();
-      const queue = salesQueue();
-      tx.siteVisit.findFirst.mockResolvedValue(completedVisit());
+      const queue = {
+        ...salesQueue(),
+        leadStatus: ['NEW'],
+        leadPriority: ['HOT'],
+        leadSource: ['WEBSITE'],
+      };
+      tx.siteVisit.findFirst.mockResolvedValueOnce(completedVisit({
+        lead: {
+          id: 'lead-1',
+          ownerId: 'svc-user',
+          status: 'SITE_VISIT_HAPPENED',
+          source: 'GRE',
+          priority: 'WARM',
+          lastSourceOfEnquiry: 'GRE',
+          owner: { profile: { name: 'SVC' } },
+        },
+      }));
       tx.rRQueue.findMany.mockResolvedValue([queue]);
       tx.rRQueue.findFirst.mockResolvedValue(queue);
       tx.user.findFirst.mockResolvedValue({ profile: { name: 'SVC' } });
 
       const result = await assignCompletedSiteVisitToSalesInTransaction(tx, 'visit-1', 'tenant-1');
 
-      expect(result).toMatchObject({ assignedUserId: 'sales-user', queueId: 'sales-queue', pendingReason: null });
+      expect(result).toMatchObject({
+        assignedUserId: 'sales-user',
+        leadOwnerChanged: true,
+        queueId: 'sales-queue',
+        pendingReason: null,
+      });
       expect(tx.rRQueue.findMany).toHaveBeenCalledWith(expect.objectContaining({
         where: { tenantId: 'tenant-1', active: true, members: { some: { userType: 'Sales' } } },
       }));
@@ -700,7 +720,7 @@ describe('selectNextSequenceMember', () => {
 
     it('leaves a completed visit pending instead of selecting an unrelated project queue', async () => {
       const tx = mockTransaction();
-      tx.siteVisit.findFirst.mockResolvedValue(completedVisit());
+      tx.siteVisit.findFirst.mockResolvedValueOnce(completedVisit());
       tx.rRQueue.findMany.mockResolvedValue([]);
 
       const result = await assignCompletedSiteVisitToSalesInTransaction(tx, 'visit-1', 'tenant-1');
@@ -710,6 +730,44 @@ describe('selectNextSequenceMember', () => {
       expect(tx.lead.update).not.toHaveBeenCalled();
       expect(tx.siteVisit.update).toHaveBeenCalledWith(expect.objectContaining({
         data: expect.objectContaining({ salesHandoffPendingReason: result.pendingReason }),
+      }));
+    });
+
+    it('assigns a later completed visit without changing the Lead owner', async () => {
+      const tx = mockTransaction();
+      const queue = salesQueue();
+      tx.siteVisit.findFirst
+        .mockResolvedValueOnce(completedVisit({
+          id: 'visit-2',
+          assigneeId: 'visit-creator',
+          lead: {
+            id: 'lead-1',
+            ownerId: 'first-sales-user',
+            status: 'SITE_VISIT_HAPPENED',
+            owner: { profile: { name: 'Sales Executive' } },
+          },
+        }))
+        .mockResolvedValueOnce({ id: 'previous-visit' });
+      tx.rRQueue.findMany.mockResolvedValue([queue]);
+      tx.rRQueue.findFirst.mockResolvedValue(queue);
+
+      const result = await assignCompletedSiteVisitToSalesInTransaction(tx, 'visit-2', 'tenant-1');
+
+      expect(result).toMatchObject({
+        assignedUserId: 'sales-user',
+        leadOwnerChanged: false,
+        queueId: 'sales-queue',
+        pendingReason: null,
+      });
+      expect(tx.lead.update).not.toHaveBeenCalled();
+      expect(tx.siteVisit.update).toHaveBeenCalledWith(expect.objectContaining({
+        where: { id: 'visit-2' },
+        data: expect.objectContaining({ assigneeId: 'sales-user' }),
+      }));
+      expect(tx.rRQueueHistory.createMany).toHaveBeenCalledWith(expect.objectContaining({
+        data: expect.arrayContaining([
+          expect.objectContaining({ field: 'Site Visit Owner', originalValue: 'visit-creator', newValue: 'sales-user' }),
+        ]),
       }));
     });
 
@@ -737,7 +795,7 @@ describe('selectNextSequenceMember', () => {
       const tx = mockTransaction();
       const queue = salesQueue();
       queue.members[0].isAvailable = false;
-      tx.siteVisit.findFirst.mockResolvedValue(completedVisit());
+      tx.siteVisit.findFirst.mockResolvedValueOnce(completedVisit());
       tx.rRQueue.findMany.mockResolvedValue([queue]);
       tx.rRQueue.findFirst.mockResolvedValue(queue);
 

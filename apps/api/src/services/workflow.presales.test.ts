@@ -14,6 +14,15 @@ describe('presales site visit scheduling', () => {
     expect(canScheduleSiteVisit('SVC', 'INCOMING')).toBe(false);
   });
 
+  it('allows authorized scheduling profiles to schedule another visit after one happened', () => {
+    for (const profile of ['Presales', 'SVC', 'Sales Executive', 'Admin', 'CRM Admin', 'Manager']) {
+      expect(canScheduleSiteVisit(profile, 'SITE_VISIT_HAPPENED')).toBe(true);
+      expect(canTransitionStatus(profile, 'SITE_VISIT_HAPPENED', 'SITE_VISIT_SCHEDULED')).toBe(true);
+    }
+    expect(canScheduleSiteVisit('Sales', 'SITE_VISIT_HAPPENED')).toBe(false);
+    expect(canScheduleSiteVisit('Recovery', 'SITE_VISIT_HAPPENED')).toBe(false);
+  });
+
   it('still blocks Presales from completing a scheduled visit', () => {
     expect(canTransitionStatus('pre sales', 'SITE_VISIT_SCHEDULED', 'SITE_VISIT_HAPPENED')).toBe(false);
   });

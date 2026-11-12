@@ -16,8 +16,10 @@ const database = vi.hoisted(() => ({
   fieldDefinitionFindFirst: vi.fn(),
   fieldDefinitionAggregate: vi.fn(),
   fieldDefinitionCreate: vi.fn(),
+  fieldDefinitionUpdate: vi.fn(),
   picklistValueFindMany: vi.fn(),
   picklistValueCreateMany: vi.fn(),
+  picklistValueUpdateMany: vi.fn(),
   leadStatusSettingFindUnique: vi.fn(),
   pageLayoutFindFirst: vi.fn(),
   pageLayoutCreate: vi.fn(),
@@ -26,6 +28,8 @@ const database = vi.hoisted(() => ({
   auditLogFindFirst: vi.fn(),
   userFindUnique: vi.fn(),
   sequenceUpsert: vi.fn(),
+  siteVisitCreate: vi.fn(),
+  siteVisitFindUniqueOrThrow: vi.fn(),
   transaction: vi.fn(),
 }));
 
@@ -57,6 +61,7 @@ vi.mock('@dct-crm/db', () => ({
     picklistValue: {
       findMany: database.picklistValueFindMany,
       createMany: database.picklistValueCreateMany,
+      updateMany: database.picklistValueUpdateMany,
     },
     leadStatusSetting: { findUnique: database.leadStatusSettingFindUnique },
     pageLayout: {
@@ -280,6 +285,12 @@ beforeEach(() => {
   database.auditLogCreate.mockResolvedValue({});
   database.auditLogFindFirst.mockResolvedValue(null);
   database.userFindUnique.mockResolvedValue({ firstName: 'Pre Sales', lastName: 'User' });
+  database.siteVisitCreate.mockResolvedValue({ id: 'site-visit-a' });
+  database.siteVisitFindUniqueOrThrow.mockResolvedValue({
+    id: 'site-visit-a',
+    assignee: { id: 'svc-a', firstName: 'SVC', lastName: 'User' },
+    project: { id: 'project-a', name: 'Project A' },
+  });
   database.leadFindMany.mockResolvedValue([]);
   database.leadCount.mockResolvedValue(1);
   rrQueue.assignLeadInTransaction.mockResolvedValue({ assignedUserId: 'svc-member-a' });
@@ -302,10 +313,12 @@ beforeEach(() => {
         findFirst: database.fieldDefinitionFindFirst,
         aggregate: database.fieldDefinitionAggregate,
         create: database.fieldDefinitionCreate,
+        update: database.fieldDefinitionUpdate,
       },
       picklistValue: {
         findMany: database.picklistValueFindMany,
         createMany: database.picklistValueCreateMany,
+        updateMany: database.picklistValueUpdateMany,
       },
       pageLayout: {
         findFirst: database.pageLayoutFindFirst,
@@ -321,7 +334,10 @@ beforeEach(() => {
         create: vi.fn().mockResolvedValue({ id: 'enquiry-1' }),
       },
       tenant: { findUnique: vi.fn().mockResolvedValue(null) },
-      siteVisit: { create: vi.fn() },
+      siteVisit: {
+        create: database.siteVisitCreate,
+        findUniqueOrThrow: database.siteVisitFindUniqueOrThrow,
+      },
       $executeRaw: vi.fn().mockResolvedValue(1),
       $queryRaw: vi.fn().mockResolvedValue([]),
     }),
@@ -634,6 +650,42 @@ describe('PUT /api/leads/:id owner protection', () => {
 });
 
 describe('POST /api/leads/:id/schedule-site-visit project validation', () => {
+  it('creates a visit assigned to its creator without requiring an SVC round-robin queue', async () => {
+    database.leadFindFirst.mockResolvedValueOnce({
+      id: 'lead-a',
+      tenantId: 'tenant-a',
+      ownerId: 'svc-a',
+      status: 'SITE_VISIT_HAPPENED',
+      owner: { id: 'svc-a', firstName: 'SVC', lastName: 'User' },
+    });
+    database.projectFindFirst.mockResolvedValueOnce({ id: 'project-a' });
+
+    const response = await scheduleSiteVisit({
+      projectId: 'project-a',
+      scheduledAt: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+      visitType: 'Site Visit',
+      rating: null,
+      transport: null,
+      callSummaryRemarks: 'Follow-up visit',
+      minimumBudget: '20 lakhs',
+      maximumBudget: '30 lakhs',
+      propertyType: ['Apartment'],
+      bedroomPreference: ['3 BHK'],
+    });
+
+    expect(response.status).toBe(200);
+    expect(database.siteVisitCreate).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({
+        creatorId: 'svc-a',
+        assigneeId: 'svc-a',
+        leadId: 'lead-a',
+      }),
+    }));
+    expect(database.leadUpdate).toHaveBeenCalledWith(expect.objectContaining({
+      data: { status: 'SITE_VISIT_SCHEDULED', lostAt: null },
+    }));
+  });
+
   it('rejects a project outside the authenticated tenant before assignment or creation', async () => {
     const response = await scheduleSiteVisit({
       projectId: 'project-from-tenant-b',

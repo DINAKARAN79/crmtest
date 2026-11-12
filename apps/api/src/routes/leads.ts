@@ -35,7 +35,6 @@ import { validateObjectCustomFields } from '../services/customFieldValidation';
 import { layoutWriteError } from '../services/layoutAccess';
 import {
   assignLeadToProjectRoundRobinInTransaction,
-  assignSiteVisitToSVCInTransaction,
   assignCompletedSiteVisitToSalesInTransaction,
   findApplicableRRQueue,
   hasLeadAssignmentRelevantChanges,
@@ -1481,7 +1480,7 @@ router.put('/:id', authorize('Lead', 'edit'), async (req: AuthRequest, res: Resp
       const persistedUpdateData = {
         ...updateData,
         ...(assignment ? { ownerId: assignment.assignedUserId, rrQueueId: assignment.queueId } : {}),
-        ...(salesHandoff?.assignedUserId
+        ...(salesHandoff?.leadOwnerChanged && salesHandoff.assignedUserId
           ? { ownerId: salesHandoff.assignedUserId, rrQueueId: salesHandoff.queueId }
           : {}),
       };
@@ -1497,7 +1496,7 @@ router.put('/:id', authorize('Lead', 'edit'), async (req: AuthRequest, res: Resp
         ? await moveLeadToBookedBucket(lead.id, 'api', tx, req.user!.id)
         : null;
 
-      const workflowAssigned = !!assignment || !!salesHandoff?.assignedUserId || bookedStatusTransition;
+      const workflowAssigned = !!assignment || !!salesHandoff?.leadOwnerChanged || bookedStatusTransition;
       const auditNewValues = reason ? { ...newValues, reason } : newValues;
       const auditData = {
         tenantId: existingLead.tenantId,
@@ -1510,7 +1509,7 @@ router.put('/:id', authorize('Lead', 'edit'), async (req: AuthRequest, res: Resp
         newValues: {
           ...auditNewValues,
           ...(assignment ? { ownerId: assignment.assignedUserId, rrQueueId: assignment.queueId } : {}),
-          ...(salesHandoff?.assignedUserId
+          ...(salesHandoff?.leadOwnerChanged && salesHandoff.assignedUserId
             ? { ownerId: salesHandoff.assignedUserId, rrQueueId: salesHandoff.queueId }
             : {}),
         },
@@ -2020,10 +2019,10 @@ router.post('/:id/schedule-site-visit', authorize('Lead', 'edit'), async (req: A
 
     if (!canScheduleSiteVisit(profileName, lead.status)) {
       if (canonicalProfileName(profileName) === 'Presales') {
-        return res.status(400).json({ success: false, error: 'Presales can schedule a site visit from a New, Incoming, or Prospect lead' });
+        return res.status(400).json({ success: false, error: 'Presales can schedule a site visit from a New, Incoming, Prospect, or Site Visit Happened lead' });
       }
-      if (lead.status !== 'PROSPECT') {
-        return res.status(400).json({ success: false, error: 'Lead must be in Prospect status to schedule site visit' });
+      if (lead.status !== 'PROSPECT' && lead.status !== 'SITE_VISIT_HAPPENED') {
+        return res.status(400).json({ success: false, error: 'Lead must be in Prospect or Site Visit Happened status to schedule a site visit' });
       }
       return res.status(403).json({ success: false, error: 'Not authorized to schedule site visits' });
     }
@@ -2045,6 +2044,7 @@ router.post('/:id/schedule-site-visit', authorize('Lead', 'edit'), async (req: A
           leadId: lead.id,
           projectId,
           creatorId: req.user!.id,
+          assigneeId: req.user!.id,
           siteVisitNumber,
           scheduledAt: new Date(scheduledAt),
           status: 'SCHEDULED',
@@ -2065,11 +2065,6 @@ router.post('/:id/schedule-site-visit', authorize('Lead', 'edit'), async (req: A
         select: { id: true },
       });
 
-      await assignSiteVisitToSVCInTransaction(tx, {
-        siteVisitId: siteVisit.id,
-        tenantId: lead.tenantId,
-        actorId: req.user!.id,
-      });
       const updatedLead = await tx.lead.update({
         where: { id: req.params.id },
         data: { status: 'SITE_VISIT_SCHEDULED', lostAt: null },
@@ -2122,9 +2117,6 @@ router.post('/:id/schedule-site-visit', authorize('Lead', 'edit'), async (req: A
   } catch (error: any) {
     if (error?.message === 'PROJECT_NOT_AVAILABLE') {
       return res.status(404).json({ success: false, error: 'Project not found' });
-    }
-    if (error?.message === 'SVC_QUEUE_NOT_CONFIGURED' || error?.message === 'NO_ELIGIBLE_SVC_MEMBER') {
-      return res.status(409).json({ success: false, error: 'No eligible SVC member is available in a round-robin queue matching this project and lead source.' });
     }
     console.error('Schedule site visit error:', error);
     res.status(500).json({ success: false, error: 'Failed to schedule site visit' });

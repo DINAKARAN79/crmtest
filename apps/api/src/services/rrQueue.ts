@@ -114,7 +114,7 @@ export function calculateQueueMatchScore(queue: Record<string, any>, lead: Recor
     else score -= 1_000_000;
   }
 
-  if (queuePriority.length > 0) {
+  if (queuePriority.length > 0 && !lead?.ignorePriorityCriteria) {
     if (matchesValue(leadPriority, queuePriority)) score += 100_000;
     else score -= 100_000;
   }
@@ -163,7 +163,7 @@ function matchesConfiguredQueueCriteria(queue: Record<string, any>, lead: Record
   const leadTertiary = normalizeText(lead?.tertiarySource ?? lead?.lastTertiarySource ?? lead?.tertiary);
 
   if (status.length && !lead?.ignoreStatusCriteria && !matchesValue(leadStatus, status)) return false;
-  if (priority.length && !matchesValue(leadPriority, priority)) return false;
+  if (priority.length && !lead?.ignorePriorityCriteria && !matchesValue(leadPriority, priority)) return false;
   if (!lead?.ignoreSourceCriteria && secondary.length && !matchesValue(leadSecondary, secondary)) return false;
   if (!lead?.ignoreSourceCriteria && tertiary.length && !matchesValue(leadTertiary, tertiary)) return false;
   if (!lead?.ignoreSourceCriteria && sources.length) {
@@ -563,8 +563,10 @@ export async function findProjectRRQueue(
     secondarySource?: string | null;
     tertiarySource?: string | null;
     priority?: string | null;
+    ignorePriorityCriteria?: boolean;
     category?: string | null;
     ignoreStatusCriteria?: boolean;
+    ignoreSourceCriteria?: boolean;
   },
 ) {
   const queues = await tx.rRQueue.findMany({
@@ -754,7 +756,8 @@ export async function assignCompletedSiteVisitToSalesInTransaction(
   if (visit.salesHandoffAt) {
     return {
       alreadyAssigned: true,
-      assignedUserId: visit.lead.ownerId,
+      assignedUserId: visit.assigneeId ?? visit.lead.ownerId,
+      leadOwnerChanged: false,
       queueId: visit.salesHandoffQueueId,
       pendingReason: null,
     };
@@ -777,16 +780,44 @@ export async function assignCompletedSiteVisitToSalesInTransaction(
         newValues: { projectId: visit.projectId, reason },
       },
     });
-    return { alreadyAssigned: false, assignedUserId: null, queueId: null, pendingReason: reason };
+    return {
+      alreadyAssigned: false,
+      assignedUserId: null,
+      leadOwnerChanged: false,
+      queueId: null,
+      pendingReason: reason,
+    };
   };
 
   if (!visit.projectId) return markPending('The completed site visit has no project; Sales assignment is pending.');
+
+  await tx.$queryRaw(Prisma.sql`
+    SELECT "id" FROM "Lead"
+    WHERE "id" = ${visit.leadId} AND "tenantId" = ${tenantId}
+    FOR UPDATE
+  `);
+  const previousSalesHandoff = await tx.siteVisit.findFirst({
+    where: {
+      tenantId,
+      leadId: visit.leadId,
+      id: { not: visit.id },
+      salesHandoffAt: { not: null },
+    },
+    select: { id: true },
+  });
+  const changeLeadOwner = !previousSalesHandoff;
+
   const queue = await findProjectRRQueue(
     tenantId,
     visit.projectId,
     'Sales',
     tx,
-    rrQueueCriteriaForLead(visit.lead, visit.project?.name),
+    {
+      ...rrQueueCriteriaForLead(visit.lead, visit.project?.name),
+      ignoreStatusCriteria: true,
+      ignorePriorityCriteria: true,
+      ignoreSourceCriteria: true,
+    },
   );
   if (!queue) return markPending(`No active Sales Round Robin queue is configured for ${visit.project?.name || 'this project'}.`);
 
@@ -806,30 +837,32 @@ export async function assignCompletedSiteVisitToSalesInTransaction(
   const lead = visit.lead;
   const assignedAt = new Date();
   const ownerName = `${member.user.firstName} ${member.user.lastName}`.trim() || member.user.email;
-  const oldOwner = lead.ownerId
+  const oldOwner = changeLeadOwner && lead.ownerId
     ? await tx.user.findFirst({
       where: { id: lead.ownerId, tenantId },
       select: { profile: { select: { name: true } } },
     })
     : null;
 
-  await tx.lead.update({
-    where: { id: lead.id },
-    data: { ownerId: member.userId, rrQueueId: queue.id },
-  });
-  if (lead.ownerId !== member.userId) {
-    await createOwnerHistory({
-      tenantId,
-      leadId: lead.id,
-      previousOwnerId: lead.ownerId,
-      newOwnerId: member.userId,
-      previousProfile: oldOwner?.profile?.name || null,
-      newProfile: member.user.profile?.name || null,
-      previousStatus: lead.status,
-      newStatus: lead.status,
-      handoffReason: `GRE-confirmed site visit completed for ${visit.project?.name || 'project'}`,
-      changedById: actorId,
-    }, tx);
+  if (changeLeadOwner) {
+    await tx.lead.update({
+      where: { id: lead.id },
+      data: { ownerId: member.userId, rrQueueId: queue.id },
+    });
+    if (lead.ownerId !== member.userId) {
+      await createOwnerHistory({
+        tenantId,
+        leadId: lead.id,
+        previousOwnerId: lead.ownerId,
+        newOwnerId: member.userId,
+        previousProfile: oldOwner?.profile?.name || null,
+        newProfile: member.user.profile?.name || null,
+        previousStatus: lead.status,
+        newStatus: lead.status,
+        handoffReason: `GRE-confirmed site visit completed for ${visit.project?.name || 'project'}`,
+        changedById: actorId,
+      }, tx);
+    }
   }
 
   await tx.rRQueue.update({
@@ -846,10 +879,10 @@ export async function assignCompletedSiteVisitToSalesInTransaction(
         tenantId,
         rrQueueId: queue.id,
         leadId: lead.id,
-        field: 'Sales Owner',
+        field: changeLeadOwner ? 'Sales Owner' : 'Site Visit Owner',
         userId: member.userId,
         userName: ownerName,
-        originalValue: lead.ownerId,
+        originalValue: changeLeadOwner ? lead.ownerId : visit.assigneeId,
         newValue: member.userId,
       },
       {
@@ -881,14 +914,20 @@ export async function assignCompletedSiteVisitToSalesInTransaction(
       action: 'RR_SALES_HANDOFF_COMPLETED',
       objectType: 'SiteVisit',
       objectId: visit.id,
-      oldValues: { ownerId: lead.ownerId },
-      newValues: { ownerId: member.userId, queueId: queue.id, projectId: visit.projectId },
+      oldValues: { ownerId: lead.ownerId, siteVisitAssigneeId: visit.assigneeId },
+      newValues: {
+        ownerId: changeLeadOwner ? member.userId : lead.ownerId,
+        siteVisitAssigneeId: member.userId,
+        queueId: queue.id,
+        projectId: visit.projectId,
+      },
     },
   });
 
   return {
     alreadyAssigned: false,
     assignedUserId: member.userId,
+    leadOwnerChanged: changeLeadOwner,
     queueId: queue.id,
     pendingReason: null,
   };

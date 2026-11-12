@@ -41,6 +41,7 @@ export const STATUS_TRANSITIONS: Record<string, { next: LeadStatus; profiles: st
     { next: LeadStatus.PROSPECT, profiles: ['SVC', 'Sales Executive', 'Admin', 'CRM Admin', 'Manager'] },
   ],
   [LeadStatus.SITE_VISIT_HAPPENED]: [
+    { next: LeadStatus.SITE_VISIT_SCHEDULED, profiles: ['SVC', 'Presales', 'Sales Executive', 'Admin', 'CRM Admin', 'Manager'] },
     { next: LeadStatus.LOST, profiles: ['CRM', 'Sales', 'Sales Executive', 'Admin', 'CRM Admin', 'Manager'] },
   ],
   [LeadStatus.LOST]: [
@@ -69,8 +70,8 @@ export function canScheduleSiteVisit(profileName: string, leadStatus: string): b
   const profile = canonicalProfileName(profileName);
   const status = String(leadStatus || '').trim().toUpperCase();
   if (profile === 'Presales' && (status === 'NEW' || status === 'INCOMING')) return true;
-  if (profile === 'Admin' || profile === 'Manager' || profile === 'CRM Admin') return status === 'PROSPECT';
-  return status === 'PROSPECT' && canTransitionStatus(profile, 'PROSPECT', 'SITE_VISIT_SCHEDULED');
+  if (status !== 'PROSPECT' && status !== 'SITE_VISIT_HAPPENED') return false;
+  return canTransitionStatus(profile, 'PROSPECT', 'SITE_VISIT_SCHEDULED');
 }
 
 export function canTransitionStatus(
